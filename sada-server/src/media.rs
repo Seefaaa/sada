@@ -63,7 +63,6 @@ impl AudioSink {
             );
         }
 
-        #[cfg(debug_assertions)]
         if let Some(dumper) = &mut self.dumper
             && let Err(err) = dumper.write_frame(&data.data)
             && (self.frame_count <= 3 || self.frame_count.is_multiple_of(100))

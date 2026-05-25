@@ -5,6 +5,7 @@ extern crate tracing;
 
 mod config;
 mod control;
+#[cfg(feature = "audio_dump")]
 mod media;
 mod session;
 mod signaling;

@@ -38,10 +38,9 @@ use tokio::{
     time,
 };
 
-use crate::{
-    media::AudioSink,
-    signaling::{AppState, SignalMessage},
-};
+#[cfg(feature = "audio_dump")]
+use crate::media::AudioSink;
+use crate::signaling::{AppState, SignalMessage};
 
 /// Result type used by session setup.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -201,6 +200,7 @@ pub struct Session {
     /// Room state used to forward audio between peers.
     room: SessionRoom,
     /// Debug audio sink.
+    #[cfg(feature = "audio_dump")]
     sink: AudioSink,
     /// Sender for outgoing messages to the client WebSocket.
     signal_tx: mpsc::Sender<SignalMessage>,
@@ -356,6 +356,7 @@ impl Session {
                 }
             },
             Event::MediaData(data) => {
+                #[cfg(feature = "audio_dump")]
                 self.sink.handle_frame(&data);
                 if let Err(err) = self
                     .room
@@ -509,12 +510,14 @@ impl SessionBuilder {
         room: &Room,
     ) -> Session {
         let room = room.join();
+        #[cfg(feature = "audio_dump")]
         let id = room.id.0;
 
         Session {
             rtc: self.rtc,
             socket: self.socket,
             room,
+            #[cfg(feature = "audio_dump")]
             sink: AudioSink::new(id),
             signal_tx,
             signal_rx,

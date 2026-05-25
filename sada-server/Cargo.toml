@@ -8,13 +8,13 @@ workspace = true
 
 [features]
 default = []
-audio_dump = []
+audio_dump = ["hound", "opus"]
 
 [dependencies]
 axum.workspace = true
 futures-util.workspace = true
-hound.workspace = true
-opus.workspace = true
+hound = { workspace = true, optional = true }
+opus = { workspace = true, optional = true }
 postcard.workspace = true
 sada-common = { workspace = true, features = ["async"] }
 serde.workspace = true
