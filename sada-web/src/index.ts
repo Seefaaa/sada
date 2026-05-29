@@ -222,12 +222,10 @@ export class Sada extends LitElement {
         this.muted = this.rtc.toggleMute();
     }
 
-    protected render(): TemplateResult {
-        let controls: TemplateResult | typeof nothing;
-
+    private connectionStateTemplate(): TemplateResult | typeof nothing {
         switch (this.connectionState) {
             case "disconnected":
-                controls = html`
+                return html`
                     <button
                         class="btn-connect"
                         @click="${() => this.tryConnect()}"
@@ -235,9 +233,8 @@ export class Sada extends LitElement {
                         Connect
                     </button>
                 `;
-                break;
             case "connecting":
-                controls = html`
+                return html`
                     <button
                         class="btn-disconnect"
                         @click="${() => this.cleanup()}"
@@ -245,9 +242,8 @@ export class Sada extends LitElement {
                         Cancel
                     </button>
                 `;
-                break;
             case "connected":
-                controls = html`
+                return html`
                     <button
                         class=${this.muted ? "btn-unmute" : "btn-mute"}
                         @click="${() => this.toggleMute()}"
@@ -261,12 +257,12 @@ export class Sada extends LitElement {
                         Disconnect
                     </button>
                 `;
-                break;
             default:
-                controls = nothing;
-                break;
+                return nothing;
         }
+    }
 
+    protected render(): TemplateResult {
         return html`
             <div class="container">
                 <audio class="remote-audio" autoplay playsinline></audio>
@@ -276,7 +272,7 @@ export class Sada extends LitElement {
                     ${this.connectionState}
                 </span>
 
-                <div class="controls">${controls}</div>
+                <div class="controls">${this.connectionStateTemplate()}</div>
             </div>
         `;
     }
