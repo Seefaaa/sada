@@ -2135,27 +2135,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sada-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "futures-util",
- "hound",
- "opus",
- "postcard",
- "sada-common",
- "serde",
- "serde_json",
- "str0m",
- "systemstat",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "sada-server2"
 version = "0.1.0"
 dependencies = [
