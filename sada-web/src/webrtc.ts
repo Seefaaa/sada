@@ -53,6 +53,12 @@ export class WebRTCManager {
         });
     }
 
+    /**
+     * Send the one offer this client ever makes.
+     *
+     * Every later negotiation is started by the server, which is what keeps the
+     * two sides from ever offering at the same time.
+     */
     async createOffer(): Promise<void> {
         const offer = await this.peerConnection.createOffer();
         await this.peerConnection.setLocalDescription(offer);
@@ -71,6 +77,7 @@ export class WebRTCManager {
         );
     }
 
+    /** Accept a server-initiated renegotiation, usually adding audio slots. */
     async applyOffer(sdp: string): Promise<void> {
         return this.enqueueSignaling(async () => {
             await this.peerConnection.setRemoteDescription({ type: "offer", sdp });
@@ -88,6 +95,12 @@ export class WebRTCManager {
         });
     }
 
+    /**
+     * Flip the microphone and tell the server.
+     *
+     * Disabling the track already stops audio leaving the browser; telling the
+     * server lets it stop relaying immediately and inform the game.
+     */
     toggleMute(): boolean {
         if (!this.localStream) return false;
         const tracks = this.localStream.getAudioTracks();
@@ -97,7 +110,16 @@ export class WebRTCManager {
         tracks.forEach((track) => {
             track.enabled = newEnabled;
         });
-        return !newEnabled;
+
+        const muted = !newEnabled;
+
+        try {
+            this.signaling.send({ type: "mute", muted });
+        } catch {
+            // The socket is already gone; the local track state still stands.
+        }
+
+        return muted;
     }
 
     hangup(): void {

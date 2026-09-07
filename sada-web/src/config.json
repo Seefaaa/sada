@@ -1,4 +1,4 @@
 {
-    "signalingPort": 3000,
+    "signalingUrl": "ws://{hostname}:3000/ws",
     "iceServers": ["stun:stun.cloudflare.com:3478"]
 }

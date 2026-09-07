@@ -26,8 +26,35 @@ fn get_version() -> &str { env!("CARGO_PKG_VERSION") }
 #[byond::function]
 fn init(path: &str) -> String { encode_response(control::init(path)) }
 
+/// Registers an authentication code.
 #[byond::function]
-fn set_ptt(ckey: &str, pressed: &str) -> String { encode_response(control::set_ptt(ckey.to_owned(), pressed == "1")) }
+fn register_code(code: &str, ckey: &str) -> String {
+    match control::register_code(code, ckey) {
+        ControlResponse::Ok => "ok".to_owned(),
+        ControlResponse::Error { message } => message,
+        other => format!("unexpected response: {other:?}"),
+    }
+}
+
+/// Returns the session bound to `ckey` as a decimal string, or `0` if none.
+#[byond::function]
+fn check_auth(ckey: &str) -> String {
+    match control::check_auth(ckey) {
+        ControlResponse::Session { session } => session.map_or(0, sada_common::SessionId::as_raw).to_string(),
+        _ => "0".to_owned(),
+    }
+}
+
+/// Starts transmitting. An empty `freq` means local speech.
+#[byond::function]
+fn set_ptt(session: u64, freq: &str) -> String {
+    let channel = if freq.is_empty() { None } else { freq.parse().ok() };
+    encode_response(control::set_ptt(session, channel))
+}
+
+/// Stops transmitting.
+#[byond::function]
+fn clear_ptt(session: u64) -> String { encode_response(control::clear_ptt(session)) }
 
 #[byond::function]
 fn echo(arg: &str) -> &str { arg }

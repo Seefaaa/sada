@@ -1,7 +1,22 @@
 [server]
+# The address and port the server listens on.
 listen = "0.0.0.0:3000"
+# Path to the Unix socket for control commands. If not set, control is disabled.
 control_socket = "/tmp/sada.sock"
 
 [webrtc]
 # IP address for WebRTC UDP sockets. If not set, auto-detects.
 # host_ip = "192.168.1.100"
+
+[auth]
+# Accept browsers that present no auth code, binding them to no player.
+# Required for standalone use without a game server. Default: true
+allow_anonymous = false
+
+[routing]
+# How the server decides who hears whom:
+#   "broadcast"   - everyone hears everyone (works with no game server)
+#   "hearer-list" - relay along the hearer lists the game computes
+#   "proximity"   - decide from raw coordinates and a distance threshold
+# Default: "broadcast"
+policy = "proximity"
