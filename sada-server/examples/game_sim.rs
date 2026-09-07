@@ -5,8 +5,8 @@
 //! without BYOND, and the effect of every game-side action is visible immediately.
 //!
 //! ```sh
-//! cargo run -p sada-server2                              # in one terminal
-//! cargo run -p sada-server2 --example game_sim           # in another
+//! cargo run -p sada-server                              # in one terminal
+//! cargo run -p sada-server --example game_sim           # in another
 //! ```
 //!
 //! Then open the web client, press `e` here to mint a code for the selected crew member, and type that code into the

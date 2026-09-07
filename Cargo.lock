@@ -2135,7 +2135,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sada-server2"
+name = "sada-server"
 version = "0.1.0"
 dependencies = [
  "axum",

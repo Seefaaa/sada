@@ -1,5 +1,5 @@
 [package]
-name = "sada-server2"
+name = "sada-server"
 version.workspace = true
 edition.workspace = true
 

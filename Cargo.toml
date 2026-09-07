@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["sada-server2", "sada-client", "sada-common"]
+members = ["sada-server", "sada-client", "sada-common"]
 
 [workspace.package]
 version = "0.1.0"
