@@ -222,14 +222,17 @@ impl Directory {
     async fn on_command(&mut self, command: DirectoryCommand) {
         match command {
             DirectoryCommand::RegisterCode { code, ckey } => {
+                debug!(?code, ckey = %ckey, "code registered");
                 self.codes.insert(code, ckey);
             },
 
             DirectoryCommand::Redeem { code, reply } => {
+                debug!(?code, "code redeemed");
                 let _ = reply.send(self.codes.remove(&code));
             },
 
             DirectoryCommand::Bind { ckey, session } => {
+                debug!(ckey = %ckey, session = %session, "player bound to session");
                 self.bindings.insert(ckey.clone(), session);
                 self.queue(ControlEvent::Authenticated { ckey, session });
             },
@@ -239,11 +242,13 @@ impl Directory {
             },
 
             DirectoryCommand::SetPtt { session, channel } => {
+                debug!(session = %session, channel = ?channel, "player changed transmit intent");
                 let transmit = Some(channel.map_or(Transmit::Local, Transmit::Radio));
                 self.worker.send(WorkerCommand::SetTransmit { session, transmit }).await;
             },
 
             DirectoryCommand::ClearPtt { session } => {
+                debug!(session = %session, "player stopped transmitting");
                 self.worker
                     .send(WorkerCommand::SetTransmit {
                         session,
@@ -259,6 +264,7 @@ impl Directory {
             },
 
             DirectoryCommand::RemovePlayer { ckey } => {
+                debug!(ckey = %ckey, "player removed");
                 self.bindings.remove(&ckey);
                 if self.players.remove(&ckey) {
                     self.publish_routing().await;

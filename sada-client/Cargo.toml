@@ -11,7 +11,7 @@ name = "sada"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-meowtonin.workspace = true
+sada-byondapi.workspace = true
 sada-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true

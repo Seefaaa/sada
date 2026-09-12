@@ -2,62 +2,134 @@
 #define SADA (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.so")
 #endif
 
-#define SADA_CALL(func, args...) call_ext(SADA, #func)(##args)
 #define SADA_CALL_BYONDAPI(func, args...) call_ext(SADA, "byond:[#func]")(##args)
 
+// Nothing below waits on the voice server. Calls that carry a result hand back a
+// ticket and the answer is collected on a later tick, because call_ext runs on
+// BYOND's only thread and a stalled server would stall the world.
+
+// A response that has not arrived yet.
+#define SADA_PENDING "pending"
+// A ticket the client does not know about: never issued, already collected, or dropped as stale.
+#define SADA_UNKNOWN "unknown"
+
+// How wait() gives the world a turn between polls. A codebase that has stoplag()
+// should define this as stoplag() before including this file.
+#ifndef SADA_YIELD
+#define SADA_YIELD sleep(world.tick_lag)
+#endif
+
 /proc/sada_get_version()
-	return SADA_CALL(get_version)
+	return SADA_CALL_BYONDAPI(get_version)
 
-/proc/sada_echo(str)
-	return SADA_CALL(echo, str)
-
-/proc/sada_echo_bapi(str)
-	return SADA_CALL_BYONDAPI(echo_bapi, str)
-
-/proc/sada_panicing()
-	return SADA_CALL(panicing)
-
-/proc/sada_panicing_bapi()
-	return SADA_CALL_BYONDAPI(panicing_bapi)
-
+// Starts the control worker. Returns the ticket the server version arrives under,
+// or 0 if the worker could not be started. Connecting happens on the worker, so a
+// server that is not up yet shows as an error on that ticket rather than here.
 /proc/sada_init(path)
-	return SADA_CALL(init, path)
+	return SADA_CALL_BYONDAPI(init, path)
 
-/proc/sada_set_ptt(ckey, pressed)
-	return SADA_CALL(set_ptt, ckey, pressed ? "1" : "0")
+// Stops the control worker and forgets every outstanding ticket.
+/proc/sada_stop()
+	SADA_CALL_BYONDAPI(stop)
 
-/proc/sada_update_position(mob/mob, x, y)
-	return SADA_CALL_BYONDAPI(update_position, mob, x, y)
+// Returns SADA_PENDING, SADA_UNKNOWN, or the JSON-encoded response.
+/proc/sada_poll(ticket)
+	return SADA_CALL_BYONDAPI(poll_ticket, ticket)
 
-/world/New()
+// The oldest error no ticket was waiting for, such as a failed fire-and-forget
+// request, or "" when there is none.
+/proc/sada_take_error()
+	return SADA_CALL_BYONDAPI(take_error)
+
+/proc/sada_register_code(code, ckey)
+	return SADA_CALL_BYONDAPI(register_code, code, ckey)
+
+/proc/sada_check_auth(ckey)
+	return SADA_CALL_BYONDAPI(check_auth, ckey)
+
+// Fire and forget: returns before the request reaches the socket. A hot microphone
+// cannot wait for a round trip.
+/proc/sada_set_ptt(session, freq)
+	SADA_CALL_BYONDAPI(set_ptt, "[session]", freq ? "[freq]" : "")
+
+/proc/sada_clear_ptt(session)
+	SADA_CALL_BYONDAPI(clear_ptt, "[session]")
+
+// Adds one player's state delta to the batch that the next sada_flush() sends.
+// Absent keys mean unchanged. Returns "" when the patch was accepted, or the reason
+// it was not; nothing reaches the socket until the flush.
+/proc/sada_patch_player(ckey, list/patch)
+	return SADA_CALL_BYONDAPI(patch_player, ckey, json_encode(patch))
+
+// Sends everything sada_patch_player() has piled up as one frame.
+/proc/sada_flush()
+	SADA_CALL_BYONDAPI(flush)
+
+// Forgets a player entirely. This drops their authentication with it, so it belongs
+// to a client going away rather than to a player changing mobs.
+/proc/sada_remove_player(ckey)
+	SADA_CALL_BYONDAPI(remove_player, ckey)
+
+// Asks for up to max queued server events. Returns the ticket they arrive under.
+/proc/sada_poll_events(max)
+	return SADA_CALL_BYONDAPI(poll_events, max)
+
+// The reason a response is a failure, or null when it is not one.
+//
+// Not every response is a list: a request that carries no result answers with the
+// bare string "ok", and every element of a batch answers the same way, so indexing a
+// response blind is a runtime error rather than a null. Read errors through here.
+/proc/sada_error_of(response)
+	if(isnull(response))
+		return "the request was dropped before the server answered it"
+
+	if(!islist(response))
+		return null
+
+	var/list/error = response["error"]
+	return error?["message"] || null
+
+// A control request whose answer has not arrived yet.
+/datum/sada_future
+	// Ticket the client answers under; cleared once the answer is taken.
+	var/ticket = 0
+
+/datum/sada_future/New(ticket)
 	. = ..()
+	src.ticket = ticket
 
-	world.log << "Hello, world!"
-	world.log << "Sada client version: [sada_get_version()]"
+// Returns /datum/poll/pending while the request is still with the worker, otherwise
+// /datum/poll/ready holding the decoded response, or null for a ticket the client
+// no longer knows about.
+/datum/sada_future/proc/poll()
+	if(!ticket)
+		return new /datum/poll/ready(null)
 
-	var/init_result = sada_init("/tmp/sada.sock")
-	var/server_version = json_decode(init_result)["version"]["version"]
+	var/raw = sada_poll(ticket)
+	if(raw == SADA_PENDING)
+		return new /datum/poll/pending
 
-	world.log << "Sada server version: [server_version]"
+	ticket = 0
+	return new /datum/poll/ready(raw == SADA_UNKNOWN ? null : json_decode(raw))
 
-	world.log << "[sada_set_ptt("test_ckey", TRUE)]"
-	world.log << "[sada_set_ptt("test_ckey", FALSE)]"
+// Yields the calling proc, not the world, until the answer arrives.
+/datum/sada_future/proc/wait()
+	var/datum/poll/result = poll()
 
-	world.log << "Echo test: [sada_echo("Hello, Sada!")]"
+	while(istype(result, /datum/poll/pending))
+		SADA_YIELD
+		result = poll()
 
-	world.log << "Byond API echo test: [sada_echo_bapi("Hello!")]"
+	var/datum/poll/ready/ready = result
+	return ready.value
 
-	var/mob/test_mob = new
-	test_mob.name = "Test Mob"
+/datum/poll
 
-	for(var/i in 1 to 5)
-		sada_update_position(test_mob, test_mob.x, test_mob.y)
-		sleep(5)
+/datum/poll/pending
 
-	test_mob.something()
+/datum/poll/ready
+	var/value
 
-	shutdown()
-
-/mob/proc/something()
-	world.log << "[src]"
-	return
+/datum/poll/ready/New(value)
+	. = ..()
+	src.value = value

@@ -1,0 +1,19 @@
+[package]
+name = "sada-byondapi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libloading.workspace = true
+paste.workspace = true
+
+[build-dependencies]
+bindgen = { workspace = true, optional = true }
+doxygen-rs.workspace = true
+
+[features]
+default = []
+generate-bindings = ["bindgen"]
+
+[lints]
+workspace = true

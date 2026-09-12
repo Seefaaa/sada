@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
 /// Install the tracing subscriber, defaulting this crate to debug level.
 fn init_tracing() {
     let filter = EnvFilter::from_default_env().add_directive(
-        "sada_server2=debug"
+        "sada_server=debug"
             .parse()
             .expect("the built-in log directive is always valid"),
     );

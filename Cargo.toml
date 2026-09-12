@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["sada-server", "sada-client", "sada-common", "sada-client-async"]
+members = [
+    "sada-byondapi",
+    "sada-client",
+    "sada-client-async",
+    "sada-common",
+    "sada-server",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,14 +14,16 @@ edition = "2024"
 
 [workspace.dependencies]
 axum = { version = "0.8", features = ["ws"] }
+bindgen = "0.73.2"
+doxygen-rs = "0.4.2"
 futures-util = "0.3"
 hound = "3.5"
-meowtonin = { git = "https://github.com/psychonaut-station/meowtonin", features = [
-    "fast-typechecking",
-] }
+libloading = "0.9.0"
 opus = "0.3"
+paste = "1.0.15"
 postcard = { version = "1", features = ["use-std"] }
 sada-common = { path = "sada-common" }
+sada-byondapi = { path = "sada-byondapi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 str0m = "0.19"
@@ -31,3 +39,11 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 missing_docs_in_private_items = "warn"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true
+strip = "debuginfo"
+split-debuginfo = "off"
