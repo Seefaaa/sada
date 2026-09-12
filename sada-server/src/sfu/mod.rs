@@ -546,6 +546,10 @@ impl Worker {
                 info!(%session, "peer disconnected");
                 return false;
             },
+            Event::Closed => {
+                info!(%session, "peer closed");
+                return false;
+            },
             Event::IceConnectionStateChange(state) => debug!(%session, ?state, "ICE state changed"),
             Event::MediaAdded(added) => peer.on_media_added(added.mid, added.kind, added.direction),
             Event::MediaData(data) => {

@@ -26,7 +26,7 @@ sada-common = { path = "sada-common" }
 sada-byondapi = { path = "sada-byondapi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-str0m = "0.19"
+str0m = "0.23.1"
 systemstat = "0.2.2"
 thiserror = "2"
 tokio = "1"
