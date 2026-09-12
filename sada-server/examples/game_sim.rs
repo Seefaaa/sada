@@ -47,6 +47,7 @@ use sada_common::{
     PlayerPatch,
     Position,
     SessionId,
+    Transmit,
 };
 
 /// Socket path used when `SADA_CONTROL_SOCKET` is unset.
@@ -617,12 +618,18 @@ impl App {
             };
 
             requests.push(match player.talking {
-                Some(Talking::Local) => ControlRequest::SetPtt { session, channel: None },
-                Some(Talking::Radio(freq)) => ControlRequest::SetPtt {
+                Some(Talking::Local) => ControlRequest::SetTransmit {
                     session,
-                    channel: Some(freq),
+                    transmit: Some(Transmit::Local),
                 },
-                None => ControlRequest::ClearPtt { session },
+                Some(Talking::Radio(freq)) => ControlRequest::SetTransmit {
+                    session,
+                    transmit: Some(Transmit::Radio(freq)),
+                },
+                None => ControlRequest::SetTransmit {
+                    session,
+                    transmit: None,
+                },
             });
             commits.push(Commit::Talking {
                 player: index,

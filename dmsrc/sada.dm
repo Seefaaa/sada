@@ -49,11 +49,11 @@
 
 // Fire and forget: returns before the request reaches the socket. A hot microphone
 // cannot wait for a round trip.
-/proc/sada_set_ptt(session, freq)
-	SADA_CALL_BYONDAPI(set_ptt, "[session]", freq ? "[freq]" : "")
+/proc/sada_start_transmitting(session, freq)
+	SADA_CALL_BYONDAPI(start_transmitting, "[session]", freq ? "[freq]" : "")
 
-/proc/sada_clear_ptt(session)
-	SADA_CALL_BYONDAPI(clear_ptt, "[session]")
+/proc/sada_stop_transmitting(session)
+	SADA_CALL_BYONDAPI(stop_transmitting, "[session]")
 
 // Adds one player's state delta to the batch that the next sada_flush() sends.
 // Absent keys mean unchanged. Returns "" when the patch was accepted, or the reason

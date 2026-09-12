@@ -18,7 +18,17 @@ use std::{
     time::Duration,
 };
 
-use sada_common::{AuthCode, Ckey, ControlFrameBuffer, ControlRequest, ControlResponse, Freq, PlayerPatch, SessionId};
+use sada_common::{
+    AuthCode,
+    Ckey,
+    ControlFrameBuffer,
+    ControlRequest,
+    ControlResponse,
+    Freq,
+    PlayerPatch,
+    SessionId,
+    Transmit,
+};
 
 use crate::dm::PatchJson;
 
@@ -374,21 +384,22 @@ pub fn check_auth(ckey: &str) -> Ticket { submit(ControlRequest::CheckAuth { cke
 /// Start transmitting, either locally or on a radio frequency.
 ///
 /// `channel` is the raw frequency, or `None` for local speech.
-pub fn set_ptt(session: u64, channel: Option<u32>) {
-    submit(
-        ControlRequest::SetPtt {
-            session: SessionId::from_raw(session),
-            channel: channel.map(Freq),
-        },
-        false,
-    );
+pub fn start_transmitting(session: u64, channel: Option<u32>) {
+    let transmit = Some(channel.map_or(Transmit::Local, |freq| Transmit::Radio(Freq(freq))));
+    set_transmit(session, transmit);
 }
 
 /// Stop transmitting.
-pub fn clear_ptt(session: u64) {
+pub fn stop_transmitting(session: u64) { set_transmit(session, None); }
+
+/// Send one transmit change.
+///
+/// Split out for convenience on the DM side.
+fn set_transmit(session: u64, transmit: Option<Transmit>) {
     submit(
-        ControlRequest::ClearPtt {
+        ControlRequest::SetTransmit {
             session: SessionId::from_raw(session),
+            transmit,
         },
         false,
     );
@@ -711,7 +722,7 @@ mod tests {
 
         // No server at all, nothing is listening on this path.
         init(path.to_str().expect("a valid utf-8 path"));
-        set_ptt(1, None);
+        stop_transmitting(1);
 
         let deadline = Instant::now() + PATIENCE;
         loop {

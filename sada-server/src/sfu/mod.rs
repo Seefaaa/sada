@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sada_common::{Ckey, SessionId};
+use sada_common::{Ckey, SessionId, Transmit};
 use str0m::{
     Candidate,
     Event,
@@ -49,7 +49,7 @@ use crate::{
     sfu::{
         deadlines::Deadlines,
         demux::AddressMap,
-        peer::{Peer, Relay, Transmit},
+        peer::{Peer, Relay},
         peers::Peers,
     },
     shutdown::Shutdown,

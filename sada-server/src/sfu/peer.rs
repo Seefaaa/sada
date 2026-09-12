@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, time::Instant};
 
-use sada_common::{Ckey, Freq, SessionId};
+use sada_common::{Ckey, SessionId, Transmit};
 use str0m::{
     Rtc,
     change::{SdpAnswer, SdpPendingOffer},
@@ -20,15 +20,6 @@ use crate::{
         timeline::SlotTimeline,
     },
 };
-
-/// What a peer is currently transmitting on.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Transmit {
-    /// Local speech, heard by whoever the game says is nearby.
-    Local,
-    /// Radio speech on a frequency.
-    Radio(Freq),
-}
 
 /// An SDP offer the server has sent and not yet had answered.
 struct Negotiation {

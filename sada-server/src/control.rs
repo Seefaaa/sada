@@ -118,13 +118,10 @@ async fn handle(request: ControlRequest, directory: &DirectoryHandle, top_level:
             session: directory.check_auth(ckey).await,
         },
 
-        ControlRequest::SetPtt { session, channel } => {
-            directory.send(DirectoryCommand::SetPtt { session, channel }).await;
-            ControlResponse::Ok
-        },
-
-        ControlRequest::ClearPtt { session } => {
-            directory.send(DirectoryCommand::ClearPtt { session }).await;
+        ControlRequest::SetTransmit { session, transmit } => {
+            directory
+                .send(DirectoryCommand::SetTransmit { session, transmit })
+                .await;
             ControlResponse::Ok
         },
 

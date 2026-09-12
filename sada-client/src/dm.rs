@@ -23,7 +23,7 @@ pub fn encode_response(response: ControlResponse) -> String {
 /// The only difference from the wire type is that session ids travel as decimal strings. They are `u64` and DM numbers
 /// are single-precision floats, so anything past 2^24 comes back mangled; the very first session id is already above
 /// 2^32 because it packs a generation into the high half. The game treats the string as an opaque token and hands it
-/// straight back to `set_ptt`.
+/// straight back to `start_transmitting`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DmResponse {

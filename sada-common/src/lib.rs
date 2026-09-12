@@ -9,7 +9,7 @@ mod frame;
 mod ids;
 
 pub use crate::{
-    control::{ControlEvent, ControlRequest, ControlResponse, Freq, PROTOCOL_VERSION, PlayerPatch, Position},
+    control::{ControlEvent, ControlRequest, ControlResponse, Freq, PROTOCOL_VERSION, PlayerPatch, Position, Transmit},
     frame::{ControlFrameBuffer, Error, MAX_CONTROL_FRAME_LEN, Result},
     ids::{AuthCode, Ckey, SessionId},
 };

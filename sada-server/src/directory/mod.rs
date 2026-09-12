@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use sada_common::{AuthCode, Ckey, ControlEvent, Freq, PlayerPatch, SessionId};
+use sada_common::{AuthCode, Ckey, ControlEvent, PlayerPatch, SessionId, Transmit};
 use tokio::{
     sync::{mpsc, oneshot},
     time::{MissedTickBehavior, interval},
@@ -27,7 +27,7 @@ use crate::{
         player::PlayerTable,
         routing::{BroadcastRouter, HearerListRouter, ProximityRouter, Router},
     },
-    sfu::{SfuEvent, WorkerCommand, WorkerHandle, peer::Transmit},
+    sfu::{SfuEvent, WorkerCommand, WorkerHandle},
     shutdown::Shutdown,
 };
 
@@ -73,17 +73,12 @@ pub enum DirectoryCommand {
         /// Where to send the answer.
         reply: oneshot::Sender<Option<SessionId>>,
     },
-    /// The game changed a player's transmit intent.
-    SetPtt {
+    /// The game changed what a session is transmitting on.
+    SetTransmit {
         /// Session to update.
         session: SessionId,
-        /// Frequency, or `None` for local speech.
-        channel: Option<Freq>,
-    },
-    /// The game stopped a player transmitting.
-    ClearPtt {
-        /// Session to update.
-        session: SessionId,
+        /// What they are transmitting on, or `None` to stop them.
+        transmit: Option<Transmit>,
     },
     /// The game updated a player's state.
     PatchPlayer {
@@ -265,20 +260,9 @@ impl Directory {
                 let _ = reply.send(self.bindings.get(&ckey).copied());
             },
 
-            DirectoryCommand::SetPtt { session, channel } => {
-                debug!(session = %session, channel = ?channel, "player changed transmit intent");
-                let transmit = Some(channel.map_or(Transmit::Local, Transmit::Radio));
+            DirectoryCommand::SetTransmit { session, transmit } => {
+                debug!(session = %session, transmit = ?transmit, "player changed transmit intent");
                 self.worker.send(WorkerCommand::SetTransmit { session, transmit }).await;
-            },
-
-            DirectoryCommand::ClearPtt { session } => {
-                debug!(session = %session, "player stopped transmitting");
-                self.worker
-                    .send(WorkerCommand::SetTransmit {
-                        session,
-                        transmit: None,
-                    })
-                    .await;
             },
 
             DirectoryCommand::PatchPlayer { ckey, patch } => {

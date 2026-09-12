@@ -173,7 +173,7 @@
 	sada_talking_session = client.sada_session
 
 	// null means local
-	sada_set_ptt(sada_talking_session, null)
+	sada_start_transmitting(sada_talking_session, null)
 	create_speaking_indicator()
 
 /mob/living/proc/sada_stop_talking()
@@ -184,7 +184,7 @@
 	remove_speaking_indicator()
 
 	if(SSsada.can_fire)
-		sada_clear_ptt(sada_talking_session)
+		sada_stop_transmitting(sada_talking_session)
 
 	sada_talking_session = null
 

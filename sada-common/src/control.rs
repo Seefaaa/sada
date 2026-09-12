@@ -37,6 +37,19 @@ pub struct Position {
     pub z: i32,
 }
 
+/// What a session is transmitting on.
+///
+/// Absence of this, as `Option::None`, is the third state: not transmitting at all. Keeping all three in one value is
+/// what lets [`ControlRequest::SetTransmit`] be a single request rather than a set and a clear.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Transmit {
+    /// Local speech, heard by whoever the game says is nearby.
+    Local,
+    /// Radio speech on a frequency.
+    Radio(Freq),
+}
+
 /// Delta update for one player's voice-relevant state.
 ///
 /// Every field is optional and absent means "unchanged". The server keeps the accumulated state; the game only ever
@@ -99,22 +112,17 @@ pub enum ControlRequest {
         /// Player to look up.
         ckey: Ckey,
     },
-    /// Update a player's transmit intent.
+    /// Update what a session is transmitting on, if anything.
     ///
-    /// `channel` is the frequency being transmitted on, or `None` for local
-    /// speech. Absence of a `SetPtt` means the player is not transmitting at
-    /// all. This is applied immediately rather than folded into the next state
-    /// snapshot, because a late release leaves the microphone hot.
-    SetPtt {
+    /// `None` stops them transmitting; [`Transmit::Local`] is local speech and
+    /// [`Transmit::Radio`] names a frequency. This is applied immediately
+    /// rather than folded into the next state snapshot, because a late release
+    /// leaves the microphone hot.
+    SetTransmit {
         /// Session to update.
         session: SessionId,
-        /// Frequency being transmitted on, or `None` for local speech.
-        channel: Option<Freq>,
-    },
-    /// Stop a player transmitting.
-    ClearPtt {
-        /// Session to update.
-        session: SessionId,
+        /// What they are transmitting on, or `None` to stop them.
+        transmit: Option<Transmit>,
     },
     /// Apply a delta to a player's state.
     PatchPlayer {
@@ -215,7 +223,7 @@ pub enum ControlEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlEvent, ControlRequest, ControlResponse, Freq, PlayerPatch, Position};
+    use super::{ControlEvent, ControlRequest, ControlResponse, Freq, PlayerPatch, Position, Transmit};
     use crate::ids::SessionId;
 
     /// Encode and decode a value through the wire format.
@@ -271,17 +279,26 @@ mod tests {
     }
 
     #[test]
-    fn push_to_talk_distinguishes_local_from_radio() {
-        let local = ControlRequest::SetPtt {
-            session: SessionId::new(1, 1),
-            channel: None,
+    fn transmitting_distinguishes_silence_from_local_from_radio() {
+        let session = SessionId::new(1, 1);
+
+        let silent = ControlRequest::SetTransmit {
+            session,
+            transmit: None,
         };
-        let radio = ControlRequest::SetPtt {
-            session: SessionId::new(1, 1),
-            channel: Some(Freq(1459)),
+        let local = ControlRequest::SetTransmit {
+            session,
+            transmit: Some(Transmit::Local),
+        };
+        let radio = ControlRequest::SetTransmit {
+            session,
+            transmit: Some(Transmit::Radio(Freq(1459))),
         };
 
+        assert_ne!(silent, local);
         assert_ne!(local, radio);
+
+        assert_eq!(round_trip(&silent), silent);
         assert_eq!(round_trip(&local), local);
         assert_eq!(round_trip(&radio), radio);
     }

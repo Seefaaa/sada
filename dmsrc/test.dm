@@ -92,7 +92,7 @@
 
 // Session ids are 64 bit and DM numbers are single-precision floats, so the client
 // hands them over as strings. Decoding one as a number loses the low bits, which is
-// exactly the slot half of the id, and every set_ptt built from it would name the
+// exactly the slot half of the id, and every start_transmitting built from it would name the
 // wrong session. This guards the day someone decides the quotes look redundant.
 /proc/sada_test_session_token()
 	var/list/as_string = json_decode("{\"session\": \"4294967303\"}")

@@ -60,17 +60,17 @@ fn check_auth(ckey: String) -> Ticket { control::check_auth(&ckey) }
 
 /// Starts transmitting. An empty `freq` means local speech.
 #[byond_fn]
-fn set_ptt(session: String, freq: String) {
+fn start_transmitting(session: String, freq: String) {
     let Ok(session) = session.parse() else { return };
     let channel = if freq.is_empty() { None } else { freq.parse().ok() };
-    control::set_ptt(session, channel);
+    control::start_transmitting(session, channel);
 }
 
 /// Stops transmitting.
 #[byond_fn]
-fn clear_ptt(session: String) {
+fn stop_transmitting(session: String) {
     let Ok(session) = session.parse() else { return };
-    control::clear_ptt(session);
+    control::stop_transmitting(session);
 }
 
 /// Adds one player's state delta to the batch that the next `flush` sends.
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn a_session_id_reaches_byond_as_a_string() {
         // DM numbers are single-precision floats. As a number this id would arrive as 4294967296 and the slot would be
-        // gone, so every set_ptt built from it would name the wrong session.
+        // gone, so every start_transmitting built from it would name the wrong session.
         let session = SessionId::new(7, 1);
         assert!(session.as_raw() > 1 << 24, "the trap only bites past 2^24");
 
