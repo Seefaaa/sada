@@ -10,6 +10,7 @@ pub mod routing;
 
 use std::{
     collections::{HashMap, VecDeque},
+    mem,
     sync::Arc,
     time::Duration,
 };
@@ -151,6 +152,8 @@ pub struct Directory {
     bindings: HashMap<Ckey, SessionId>,
     /// Events waiting for the game to collect them.
     events: VecDeque<ControlEvent>,
+    /// Whether player state has moved since the last snapshot went to the SFU.
+    routing_dirty: bool,
     /// Handle used to push routing and transmit changes to the SFU.
     worker: WorkerHandle,
     /// Commands from the control channel and WebSocket handlers.
@@ -186,6 +189,7 @@ impl Directory {
             codes: CodeTable::new(code_ttl),
             bindings: HashMap::new(),
             events: VecDeque::new(),
+            routing_dirty: false,
             worker,
             commands,
             sfu_events,
@@ -204,9 +208,19 @@ impl Directory {
             tokio::select! {
                 () = self.shutdown.recv() => break,
                 _ = sweep.tick() => self.sweep_codes(),
-                command = self.commands.recv() => match command {
-                    Some(command) => self.on_command(command).await,
-                    None => break,
+                command = self.commands.recv() => {
+                    let Some(command) = command else { break };
+
+                    self.on_command(command).await;
+
+                    // Empty the queue before recomputing anything. The game describes every player it can see in
+                    // one batch, and control.rs forwards those one command at a time, so publishing per patch
+                    // would mean a full recompute and a separate snapshot for the worker N times a tick.
+                    while let Ok(command) = self.commands.try_recv() {
+                        self.on_command(command).await;
+                    }
+
+                    self.publish_routing().await;
                 },
                 event = self.sfu_events.recv() => match event {
                     Some(event) => self.on_sfu_event(event),
@@ -266,18 +280,14 @@ impl Directory {
             },
 
             DirectoryCommand::PatchPlayer { ckey, patch } => {
-                if self.players.apply(ckey, patch) {
-                    self.publish_routing().await;
-                }
+                self.routing_dirty |= self.players.apply(ckey, patch);
             },
 
             DirectoryCommand::RemovePlayer { ckey } => {
                 debug!(ckey = %ckey, "player removed");
                 self.codes.spend(&ckey);
                 self.bindings.remove(&ckey);
-                if self.players.remove(&ckey) {
-                    self.publish_routing().await;
-                }
+                self.routing_dirty |= self.players.remove(&ckey);
             },
 
             DirectoryCommand::PollEvents { max, reply } => {
@@ -314,8 +324,14 @@ impl Directory {
         }
     }
 
-    /// Recompute the routing snapshot and hand it to the SFU.
+    /// Recompute the routing snapshot and hand it to the SFU, if player state has moved since the last one.
+    ///
+    /// Called once per drained batch of commands rather than once per change.
     async fn publish_routing(&mut self) {
+        if !mem::take(&mut self.routing_dirty) {
+            return;
+        }
+
         let routing = Arc::new(self.router.compute(&self.players));
         debug!(players = self.players.len(), "routing recomputed");
         self.worker.send(WorkerCommand::Routing(routing)).await;

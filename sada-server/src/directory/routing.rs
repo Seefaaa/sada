@@ -136,7 +136,7 @@ impl Router for HearerListRouter {
 /// Local audibility from raw coordinates.
 ///
 /// Cheaper for the game, it only reports positions, but the server has no idea about walls, so sound carries through
-/// them. Useful where the game cannot afford to compute hearer sets, and as the basis for future spatial work.
+/// them. Useful where the game cannot afford to compute hearer sets.
 #[derive(Debug)]
 pub struct ProximityRouter {
     /// Maximum distance, in tiles, at which local speech is audible.

@@ -23,13 +23,8 @@ use sada_common::SessionId;
 /// `setRemoteDescription` cost grows with the m-line count, so the pool is not allowed to grow without bound.
 ///
 /// This bounds *simultaneous* speakers: a slot whose speaker has been quiet for [`IDLE_THRESHOLD`] is taken by the
-/// next person who needs one, so reaching the ceiling means 24 people talking inside the same few seconds.
-///
-/// At the ceiling, and only while every slot is genuinely busy, a further speaker is refused and goes unheard until
-/// one falls idle. Taking a busy slot instead would be worse: with more speakers than slots, every frame would steal
-/// the slot the previous frame just took, and each of the 24 streams would carry a different voice every 20 ms. One
-/// person silent is better than everybody chopped up, and the choice is stable; whoever is without a slot stays
-/// without it, rather than the whole room taking turns being broken.
+/// next person who needs one. At the ceiling, while every slot is genuinely busy, a further speaker is refused and
+/// goes unheard until one falls idle rather than interrupting a stream that is in use.
 pub const MAX_SLOTS: usize = 24;
 
 /// How long a slot must go unused before another speaker may take it.
@@ -94,8 +89,8 @@ impl<S: Copy> SlotTable<S> {
     /// A free slot is preferred; failing that, the slot of whoever has been quiet longest is taken, but only once
     /// they have been quiet for [`IDLE_THRESHOLD`]. [`Grant::Denied`] is the caller's signal to renegotiate for more.
     ///
-    /// `now` is passed in rather than read so that the table stays a pure data structure with synthetic tests. It is
-    /// also what marks the speaker as heard, which is what keeps them from being the next one reclaimed.
+    /// `now` is passed in rather than read, so the table stays a pure data structure. It is also what marks the
+    /// speaker as heard, which is what keeps them from being the next one reclaimed.
     pub fn slot_for(&mut self, speaker: SessionId, now: Instant) -> Grant<S> {
         if let Some(assignment) = self.assigned.get_mut(&speaker) {
             assignment.last_used = now;

@@ -120,8 +120,7 @@ impl Peer {
 
     /// Relay one speaker's frame to this peer.
     ///
-    /// `now` is the instant this drain pass started; it is what tells the slot table this speaker is still being
-    /// heard, and a few milliseconds of staleness is nothing against the idle threshold it is compared with.
+    /// `now` is the instant this drain pass started, which is what marks the speaker as still being heard.
     pub fn relay(&mut self, speaker: SessionId, data: &MediaData, now: Instant) -> Relay {
         if !self.rtc.is_connected() {
             return Relay::NotConnected;
