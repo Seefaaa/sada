@@ -662,7 +662,11 @@ impl Worker {
 
         self.addresses.forget_session(session);
 
-        if let Some(ckey) = &peer.ckey {
+        // Only forget the player if the index still points at this session: they may already be on a newer one, and
+        // dropping that entry would leave a live session nobody can route audio to.
+        if let Some(ckey) = &peer.ckey
+            && self.by_ckey.get(ckey) == Some(&session)
+        {
             self.by_ckey.remove(ckey);
         }
 

@@ -58,8 +58,6 @@ SUBSYSTEM_DEF(sada)
 	/// Players left to describe in this fire, so a long run can resume next tick.
 	var/list/current_run
 
-	/// Code minted per ckey, so a player who asks twice sees the same one.
-	var/list/auth_codes = list()
 	/// Every code minted this round, so one is never handed out twice.
 	var/list/used_codes = list()
 
@@ -202,7 +200,6 @@ SUBSYSTEM_DEF(sada)
 		return
 
 	player.sada_session = session
-	auth_codes -= ckey
 
 	to_chat(player, span_notice("Voice chat connected."))
 
@@ -234,15 +231,17 @@ SUBSYSTEM_DEF(sada)
 */
 
 /// Mints a code, registers it with the server and returns it, or null if the server
-/// refused. The same player asking twice gets the same code back.
+/// refused.
+///
+/// Every call mints a new one, and deliberately does not remember the last code a
+/// player was given. The server drops a code once somebody connects with it, and
+/// again when it expires, and neither of those reaches the game; a remembered code
+/// would therefore go dead without the game noticing and the player would be handed
+/// the same useless one for the rest of the round. The server keeps only the newest
+/// code per player, so the one this returns is also the only one that still works.
 /datum/controller/subsystem/sada/proc/generate_auth_code(client/player)
 	if(isnull(player))
 		return null
-
-	var/existing = auth_codes[player.ckey]
-
-	if(existing)
-		return existing
 
 	var/code
 
@@ -257,7 +256,6 @@ SUBSYSTEM_DEF(sada)
 		return null
 
 	used_codes += code
-	auth_codes[player.ckey] = code
 
 	return code
 

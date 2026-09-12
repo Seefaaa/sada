@@ -5,6 +5,7 @@ use std::{
     fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -15,6 +16,9 @@ const CONFIG_ENV: &str = "SADA_CONFIG";
 
 /// Configuration file used when [`CONFIG_ENV`] is unset.
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
+
+/// How long an auth code lives when the configuration does not say.
+const DEFAULT_CODE_TTL_SECONDS: u64 = 300;
 
 /// Result type used by configuration loading.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -83,10 +87,22 @@ pub struct WebRtcConfig {
 pub struct AuthConfig {
     /// Accept sessions that present no auth code, binding them to no player.
     pub allow_anonymous: bool,
+    /// How long a code the game mints stays valid, in seconds.
+    pub code_ttl_seconds: u64,
 }
 
 impl Default for AuthConfig {
-    fn default() -> Self { Self { allow_anonymous: true } }
+    fn default() -> Self {
+        Self {
+            allow_anonymous: true,
+            code_ttl_seconds: DEFAULT_CODE_TTL_SECONDS,
+        }
+    }
+}
+
+impl AuthConfig {
+    /// [`code_ttl_seconds`](Self::code_ttl_seconds) as a duration.
+    pub fn code_ttl(&self) -> Duration { Duration::from_secs(self.code_ttl_seconds) }
 }
 
 impl Config {
@@ -119,6 +135,8 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{Config, RoutingPolicy};
 
     #[test]
@@ -128,6 +146,7 @@ mod tests {
         assert!(config.server.control_socket.is_none());
         assert!(config.webrtc.host_ip.is_none());
         assert!(config.auth.allow_anonymous);
+        assert_eq!(config.auth.code_ttl(), Duration::from_secs(300));
         assert_eq!(config.routing.policy, RoutingPolicy::Broadcast);
     }
 

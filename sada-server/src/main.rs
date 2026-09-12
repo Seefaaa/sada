@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     let (sfu_events, sfu_event_rx) = mpsc::channel(SFU_EVENT_BUFFER);
     let worker = Worker::spawn(socket, media_addr, sfu_events, shutdown.clone());
 
-    let directory = Directory::spawn(config.routing.policy, worker.clone(), sfu_event_rx, shutdown.clone());
+    let directory = Directory::spawn(&config, worker.clone(), sfu_event_rx, shutdown.clone());
 
     if let Some(path) = &config.server.control_socket {
         let path = path.clone();

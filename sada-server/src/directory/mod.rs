@@ -4,20 +4,26 @@
 //! WebSocket handlers, keeps the player table up to date, and pushes a fresh routing snapshot to the SFU whenever that
 //! state changes so the audio path never has to ask another task a question.
 
+pub mod codes;
 pub mod player;
 pub mod routing;
 
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 
 use sada_common::{AuthCode, Ckey, ControlEvent, Freq, PlayerPatch, SessionId};
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::{MissedTickBehavior, interval},
+};
 
 use crate::{
-    config::RoutingPolicy,
+    config::{Config, RoutingPolicy},
     directory::{
+        codes::CodeTable,
         player::PlayerTable,
         routing::{BroadcastRouter, HearerListRouter, ProximityRouter, Router},
     },
@@ -31,6 +37,12 @@ use crate::{
 /// events are dropped.
 const MAX_QUEUED_EVENTS: usize = 4096;
 
+/// How often codes nobody redeemed are swept out.
+///
+/// An expired code is refused the moment it is presented, so this only decides how long the entry lingers in memory
+/// after it stopped working.
+const CODE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// A request for the directory.
 pub enum DirectoryCommand {
     /// The game minted a code for a player.
@@ -40,14 +52,14 @@ pub enum DirectoryCommand {
         /// Player it belongs to.
         ckey: Ckey,
     },
-    /// A browser presented a code. Answers with the player it identifies.
+    /// A browser presented a code. Answers with the player it identifies, spending the code.
     Redeem {
         /// Code the browser sent.
         code: AuthCode,
         /// Where to send the resolved player.
         reply: oneshot::Sender<Option<Ckey>>,
     },
-    /// A browser session finished connecting and is bound to a player.
+    /// A browser session finished connecting and is bound to the player whose code it redeemed.
     Bind {
         /// Player that authenticated.
         ckey: Ckey,
@@ -105,7 +117,7 @@ impl DirectoryHandle {
     /// Send a command, ignoring the case where the directory has stopped.
     pub async fn send(&self, command: DirectoryCommand) { let _ = self.commands.send(command).await; }
 
-    /// Resolve an auth code to the player it identifies.
+    /// Spend an auth code, answering with the player it identifies.
     pub async fn redeem(&self, code: AuthCode) -> Option<Ckey> {
         let (reply, answer) = oneshot::channel();
         let command = DirectoryCommand::Redeem { code, reply };
@@ -138,8 +150,8 @@ pub struct Directory {
     players: PlayerTable,
     /// Policy turning that state into listener sets.
     router: Box<dyn Router>,
-    /// Codes the game has minted but nobody has redeemed yet.
-    codes: HashMap<AuthCode, Ckey>,
+    /// Codes the game has minted that nobody has connected with yet.
+    codes: CodeTable,
     /// Which session each player is bound to.
     bindings: HashMap<Ckey, SessionId>,
     /// Events waiting for the game to collect them.
@@ -158,6 +170,7 @@ impl Directory {
     /// Build a directory and its handle.
     pub fn new(
         policy: RoutingPolicy,
+        code_ttl: Duration,
         worker: WorkerHandle,
         sfu_events: mpsc::Receiver<SfuEvent>,
         shutdown: Shutdown,
@@ -175,7 +188,7 @@ impl Directory {
         let directory = Self {
             players: PlayerTable::new(),
             router,
-            codes: HashMap::new(),
+            codes: CodeTable::new(code_ttl),
             bindings: HashMap::new(),
             events: VecDeque::new(),
             worker,
@@ -189,9 +202,13 @@ impl Directory {
 
     /// Run until shutdown.
     pub async fn run(mut self) {
+        let mut sweep = interval(CODE_SWEEP_INTERVAL);
+        sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 () = self.shutdown.recv() => break,
+                _ = sweep.tick() => self.sweep_codes(),
                 command = self.commands.recv() => match command {
                     Some(command) => self.on_command(command).await,
                     None => break,
@@ -208,12 +225,18 @@ impl Directory {
 
     /// Spawn a task to run the directory until shutdown, returning a handle to talk to it.
     pub fn spawn(
-        policy: RoutingPolicy,
+        config: &Config,
         worker: WorkerHandle,
         sfu_events: mpsc::Receiver<SfuEvent>,
         shutdown: Shutdown,
     ) -> DirectoryHandle {
-        let (directory, handle) = Self::new(policy, worker, sfu_events, shutdown);
+        let (directory, handle) = Self::new(
+            config.routing.policy,
+            config.auth.code_ttl(),
+            worker,
+            sfu_events,
+            shutdown,
+        );
         tokio::spawn(directory.run());
         handle
     }
@@ -223,12 +246,13 @@ impl Directory {
         match command {
             DirectoryCommand::RegisterCode { code, ckey } => {
                 debug!(?code, ckey = %ckey, "code registered");
-                self.codes.insert(code, ckey);
+                self.codes.register(code, ckey);
             },
 
             DirectoryCommand::Redeem { code, reply } => {
-                debug!(?code, "code redeemed");
-                let _ = reply.send(self.codes.remove(&code));
+                let ckey = self.codes.redeem(&code);
+                debug!(?code, accepted = ckey.is_some(), "code redeemed");
+                let _ = reply.send(ckey);
             },
 
             DirectoryCommand::Bind { ckey, session } => {
@@ -265,6 +289,7 @@ impl Directory {
 
             DirectoryCommand::RemovePlayer { ckey } => {
                 debug!(ckey = %ckey, "player removed");
+                self.codes.spend(&ckey);
                 self.bindings.remove(&ckey);
                 if self.players.remove(&ckey) {
                     self.publish_routing().await;
@@ -294,6 +319,14 @@ impl Directory {
 
                 self.queue(ControlEvent::Disconnected { ckey, session });
             },
+        }
+    }
+
+    /// Drop the codes nobody came back for.
+    fn sweep_codes(&mut self) {
+        match self.codes.sweep() {
+            0 => {},
+            expired => debug!(expired, "auth codes expired"),
         }
     }
 

@@ -12,6 +12,8 @@ control_socket = "/tmp/sada.sock"
 # Accept browsers that present no auth code, binding them to no player.
 # Required for standalone use without a game server. Default: true
 allow_anonymous = false
+# How long a code the game mints stays valid, in seconds. Default: 300
+code_ttl_seconds = 300
 
 [routing]
 # How the server decides who hears whom:

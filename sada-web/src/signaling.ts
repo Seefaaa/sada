@@ -23,7 +23,7 @@ export type ErrorCode =
     | "badAuthCode"
     | "authRequired"
     | "unexpectedMessage"
-    | "badSessionDescription"
+    | "badSdpOffer"
     | "internal";
 
 export type ServerMessage =
@@ -109,7 +109,7 @@ const ERROR_CODES: readonly ErrorCode[] = [
     "badAuthCode",
     "authRequired",
     "unexpectedMessage",
-    "badSessionDescription",
+    "badSdpOffer",
     "internal",
 ];
 

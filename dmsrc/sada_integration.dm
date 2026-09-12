@@ -257,7 +257,8 @@
 		<iframe src="[CONFIG_GET(string/sada_web_url)]" allow="microphone" style="width: 100%; height: 280px; border: none;"></iframe>
 		<p>Open the voice chat page and enter this code:</p>
 		<code style="font-size: 2em; font-family: monospace; letter-spacing: 0.2em; cursor: pointer;">[code]📋</code>
-		<p>This code is only valid for one connection.</p>
+		<p>This code is only valid for one connection and expires after a few minutes. Ask
+		again for a fresh one, which retires this one.</p>
 		<script>
 			const codeElement = document.querySelector('code');
 			codeElement.addEventListener('click', () => {
