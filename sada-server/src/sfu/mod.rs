@@ -506,7 +506,7 @@ impl Worker {
                     }
                 },
                 Ok(Output::Event(event)) => {
-                    if !self.on_event(session, &mut peer, event) {
+                    if !self.on_event(session, &mut peer, event, now) {
                         break false;
                     }
                 },
@@ -539,7 +539,10 @@ impl Worker {
     }
 
     /// Act on one str0m event. Returns whether the peer is still usable.
-    fn on_event(&mut self, session: SessionId, peer: &mut Peer, event: Event) -> bool {
+    ///
+    /// `now` is when this drain pass began, carried down to the slot table so it can tell a speaker who is still
+    /// talking from one who has gone quiet.
+    fn on_event(&mut self, session: SessionId, peer: &mut Peer, event: Event, now: Instant) -> bool {
         match event {
             Event::Connected => info!(%session, "peer connected"),
             Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
@@ -555,7 +558,7 @@ impl Worker {
             Event::MediaData(data) => {
                 #[cfg(feature = "audio_dump")]
                 peer.capture(&data);
-                self.relay(session, peer, &data);
+                self.relay(session, peer, &data, now);
             },
             Event::SenderFeedback(_) | Event::StreamPaused(_) => {},
             other => debug!(%session, ?other, "unhandled event"),
@@ -565,17 +568,20 @@ impl Worker {
     }
 
     /// Send one speaker's frame to everyone who should hear it.
-    fn relay(&mut self, speaker: SessionId, peer: &Peer, data: &MediaData) {
+    fn relay(&mut self, speaker: SessionId, peer: &Peer, data: &MediaData, now: Instant) {
         for listener in self.listeners_for(speaker, peer) {
             let Some(target) = self.peers.get_mut(listener) else {
                 continue;
             };
 
-            match target.relay(speaker, data) {
-                // Writing queues work that only a drain will flush, so the
-                // listener must be re-examined before the loop sleeps again.
+            match target.relay(speaker, data, now) {
+                // Writing queues work that only a drain will flush, and asking
+                // for a slot queues an offer, so the listener must be
+                // re-examined before the loop sleeps again.
                 Relay::Written | Relay::NoSlot => self.touch(listener),
-                Relay::NotConnected | Relay::Rejected => {},
+                // Nothing was queued and nothing is pending, so there is
+                // nothing for a drain to find.
+                Relay::NotConnected | Relay::Rejected | Relay::Unheard => {},
             }
         }
     }

@@ -15,7 +15,10 @@ use tokio::sync::mpsc;
 use crate::audio::AudioSink;
 use crate::{
     proto::ServerMessage,
-    sfu::{slots::SlotTable, timeline::SlotTimeline},
+    sfu::{
+        slots::{Grant, SlotTable},
+        timeline::SlotTimeline,
+    },
 };
 
 /// What a peer is currently transmitting on.
@@ -47,6 +50,11 @@ pub enum Relay {
     NotConnected,
     /// No outgoing slot was free; a renegotiation has been requested.
     NoSlot,
+    /// No outgoing slot was free and none can be added, so the frame is dropped.
+    ///
+    /// Distinct from [`Relay::NoSlot`] because nothing is pending: the caller has no reason to drain this peer, and
+    /// at the slot ceiling that would otherwise happen for every frame of every speaker who does not fit.
+    Unheard,
     /// The peer has a slot but could not accept the frame.
     Rejected,
 }
@@ -120,19 +128,39 @@ impl Peer {
     }
 
     /// Relay one speaker's frame to this peer.
-    pub fn relay(&mut self, speaker: SessionId, data: &MediaData) -> Relay {
+    ///
+    /// `now` is the instant this drain pass started; it is what tells the slot table this speaker is still being
+    /// heard, and a few milliseconds of staleness is nothing against the idle threshold it is compared with.
+    pub fn relay(&mut self, speaker: SessionId, data: &MediaData, now: Instant) -> Relay {
         if !self.rtc.is_connected() {
             return Relay::NotConnected;
         }
 
-        let Some(mid) = self.slots.slot_for(speaker) else {
-            self.wants_slots = true;
-            return Relay::NoSlot;
+        let (mid, reclaimed) = match self.slots.slot_for(speaker, now) {
+            Grant::Ready(mid) => (mid, false),
+            Grant::Reclaimed(mid) => (mid, true),
+            Grant::Denied => {
+                // Only ask for a renegotiation that can actually happen: at the ceiling there is nothing to add, and
+                // asking anyway would put this peer through a full drain for every frame it cannot carry.
+                self.wants_slots = self.slots.growth_target() > 0;
+                return if self.wants_slots {
+                    Relay::NoSlot
+                } else {
+                    Relay::Unheard
+                };
+            },
         };
 
         // The slot may have carried a different speaker a moment ago, whose RTP
         // clock has no relation to this one's. Map onto the slot's own clock.
-        let emit = self.timelines.entry(mid).or_default().map(speaker, data.time.numer());
+        let timeline = self.timelines.entry(mid).or_default();
+
+        if reclaimed {
+            // Taking the slot is a speaker change like any other; the clock survives it, the source does not.
+            timeline.release();
+        }
+
+        let emit = timeline.map(speaker, data.time.numer());
 
         let Some(writer) = self.rtc.writer(mid) else {
             return Relay::Rejected;
@@ -157,8 +185,9 @@ impl Peer {
 
     /// Hand back the slot a disconnected speaker was using.
     ///
-    /// Only disconnection reaches this; a speaker who walks out of earshot keeps
-    /// their slot. See [`crate::sfu::slots::MAX_SLOTS`].
+    /// Disconnection is what reaches this. A speaker who merely goes quiet keeps
+    /// their slot until somebody else needs one, which [`Peer::relay`] handles
+    /// through [`Grant::Reclaimed`] and which ends in the same clock reset.
     pub fn release_speaker(&mut self, speaker: SessionId) {
         if let Some(mid) = self.slots.release(speaker)
             && let Some(timeline) = self.timelines.get_mut(&mid)
