@@ -51,7 +51,7 @@ pub async fn serve(socket: WebSocket, state: AppState) {
         tokio::select! {
             incoming = stream.next() => {
                 let Some(Ok(message)) = incoming else { break };
-                if !on_client_message(&state, session, message).await {
+                if !on_client_message(session, message) {
                     break;
                 }
             },
@@ -155,7 +155,10 @@ async fn establish(
 }
 
 /// Act on one message from an established client. Returns whether to continue.
-async fn on_client_message(state: &AppState, session: SessionId, message: Message) -> bool {
+///
+/// Nothing the browser sends mid-session reaches the rest of the server any more: `bye` ends the loop and everything
+/// else it can say now travels on the data channel, straight into the worker that owns its `Rtc`.
+fn on_client_message(session: SessionId, message: Message) -> bool {
     let text = match message {
         Message::Text(text) => text,
         Message::Close(_) => return false,
@@ -168,12 +171,6 @@ async fn on_client_message(state: &AppState, session: SessionId, message: Messag
     };
 
     match message {
-        ClientMessage::Answer { sdp } => {
-            state.worker.send(WorkerCommand::Answer { session, sdp }).await;
-        },
-        ClientMessage::Mute { muted } => {
-            state.worker.send(WorkerCommand::Mute { session, muted }).await;
-        },
         ClientMessage::Bye => return false,
         ClientMessage::Offer { .. } | ClientMessage::Hello { .. } => {
             warn!(%session, "client sent a message that is not valid mid-session");

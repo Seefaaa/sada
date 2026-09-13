@@ -1,10 +1,20 @@
 import config from "./config.json";
 import type { SignalingClient } from "./signaling";
 
+/** Label of the data channel, mirrored by `CHANNEL_LABEL` in `sada-server/src/sfu/peer.rs`. */
+const CHANNEL_LABEL = "main";
+
 export type CallEvents = {
     onRemoteTrack: (stream: MediaStream) => void;
     onConnectionState: (state: RTCPeerConnectionState) => void;
+    onMessage: (message: ServerChannelMessage) => void;
 };
+
+export type ClientChannelMessage =
+    | { type: "answer"; sdp: string }
+    | { type: "mute"; muted: boolean };
+
+export type ServerChannelMessage = { type: "offer"; sdp: string };
 
 export class WebRTCManager {
     private peerConnection: RTCPeerConnection;
@@ -13,6 +23,7 @@ export class WebRTCManager {
     private readonly events: CallEvents;
     private remoteStream: MediaStream;
     private signalingQueue: Promise<void> = Promise.resolve();
+    private readonly channel: RTCDataChannel;
 
     constructor(signaling: SignalingClient, events: CallEvents, iceServers?: RTCIceServer[]) {
         this.signaling = signaling;
@@ -35,6 +46,36 @@ export class WebRTCManager {
 
         this.peerConnection.onconnectionstatechange = () => {
             this.events.onConnectionState(this.peerConnection.connectionState);
+        };
+
+        this.channel = this.peerConnection.createDataChannel(CHANNEL_LABEL);
+
+        this.channel.onmessage = (event) => {
+            const msg =
+                typeof event.data === "string" ? parseServerChannelMessage(event.data) : null;
+            if (!msg) {
+                console.error("Failed to parse channel message", event.data);
+                return;
+            }
+            this.events.onMessage(msg);
+        };
+
+        this.channel.onopen = () => {
+            console.debug("data channel opened");
+            // A mute pressed before the channel was up never reached the server.
+            if (this.isMuted()) {
+                this.sendMessage({ type: "mute", muted: true });
+            }
+        };
+
+        // Losing the channel is not the end of the call, but it is the end of renegotiation: the server can no
+        // longer ask us to take more speakers, and nothing else says so out loud.
+        this.channel.onclose = () => {
+            console.warn("data channel closed; no more audio slots can be added");
+        };
+
+        this.channel.onerror = (event) => {
+            console.error("data channel error", event);
         };
     }
 
@@ -80,12 +121,18 @@ export class WebRTCManager {
     /** Accept a server-initiated renegotiation, usually adding audio slots. */
     async applyOffer(sdp: string): Promise<void> {
         return this.enqueueSignaling(async () => {
+            // Checked before the connection is touched: an answer we cannot send would leave our local
+            // description ahead of the server's, with no way to tell it so.
+            if (this.channel.readyState !== "open") {
+                throw new Error("data channel is not open; cannot answer an offer");
+            }
+
             await this.peerConnection.setRemoteDescription({ type: "offer", sdp });
             const answer = await this.peerConnection.createAnswer();
             await this.peerConnection.setLocalDescription(answer);
             await this.waitForIceGathering();
 
-            this.signaling.send({
+            this.sendMessage({
                 type: "answer",
                 // biome-ignore lint/style/noNonNullAssertion: it's set just above
                 sdp: this.peerConnection.localDescription!.sdp,
@@ -95,11 +142,25 @@ export class WebRTCManager {
         });
     }
 
+    private sendMessage(msg: ClientChannelMessage): void {
+        if (this.channel.readyState !== "open") {
+            throw new Error("data channel is not open; cannot send message");
+        }
+        this.channel.send(JSON.stringify(msg));
+    }
+
+    /** Whether the microphone is muted, as the local tracks have it. */
+    private isMuted(): boolean {
+        const tracks = this.localStream?.getAudioTracks() ?? [];
+        return tracks.length > 0 && tracks.every((track) => !track.enabled);
+    }
+
     /**
      * Flip the microphone and tell the server.
      *
      * Disabling the track already stops audio leaving the browser; telling the
-     * server lets it stop relaying immediately and inform the game.
+     * server lets it stop relaying immediately, rather than at the end of the
+     * talkspurt it is in the middle of forwarding.
      */
     toggleMute(): boolean {
         if (!this.localStream) return false;
@@ -114,9 +175,10 @@ export class WebRTCManager {
         const muted = !newEnabled;
 
         try {
-            this.signaling.send({ type: "mute", muted });
+            this.sendMessage({ type: "mute", muted });
         } catch {
-            // The socket is already gone; the local track state still stands.
+            // The channel is not open yet, or is already gone. The track is disabled either way, and a channel
+            // that has yet to open will carry the state as soon as it does.
         }
 
         return muted;
@@ -155,5 +217,31 @@ export class WebRTCManager {
         const next = this.signalingQueue.then(task, task);
         this.signalingQueue = next.catch(() => {});
         return next;
+    }
+}
+
+function parseServerChannelMessage(raw: string): ServerChannelMessage | null {
+    let parsed: unknown;
+
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return null;
+    }
+
+    if (typeof parsed !== "object" || parsed === null) return null;
+
+    const obj = parsed as Record<string, unknown>;
+
+    const str = (key: string): string | undefined =>
+        typeof obj[key] === "string" ? (obj[key] as string) : undefined;
+
+    switch (str("type")) {
+        case "offer": {
+            const sdp = str("sdp");
+            return sdp ? { type: "offer", sdp } : null;
+        }
+        default:
+            return null;
     }
 }

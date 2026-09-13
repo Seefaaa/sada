@@ -45,11 +45,11 @@ use tokio::{
 use crate::{
     config::Config,
     directory::routing::Routing,
-    proto::ServerMessage,
+    proto::{ClientChannelMessage, ServerChannelMessage, ServerMessage},
     sfu::{
         deadlines::Deadlines,
         demux::AddressMap,
-        peer::{Peer, Relay},
+        peer::{AnswerError, Peer, Relay},
         peers::Peers,
     },
     shutdown::Shutdown,
@@ -82,20 +82,6 @@ pub enum WorkerCommand {
         signal: mpsc::Sender<ServerMessage>,
         /// Where to send the assigned session id.
         reply: oneshot::Sender<SessionId>,
-    },
-    /// The browser answered an offer the server sent.
-    Answer {
-        /// Session that answered.
-        session: SessionId,
-        /// Session description.
-        sdp: String,
-    },
-    /// The browser muted or unmuted itself.
-    Mute {
-        /// Session that changed.
-        session: SessionId,
-        /// Whether the microphone is now muted.
-        muted: bool,
     },
     /// The game changed a player's transmit intent.
     SetTransmit {
@@ -346,20 +332,6 @@ impl Worker {
             } => {
                 let _ = reply.send(self.register(*rtc, ckey, signal));
             },
-            WorkerCommand::Answer { session, sdp } => {
-                let Some(peer) = self.peers.get_mut(session) else {
-                    return;
-                };
-                if let Err(err) = peer.accept_answer(&sdp) {
-                    warn!(%session, ?err, "answer rejected");
-                }
-                self.touch(session);
-            },
-            WorkerCommand::Mute { session, muted } => {
-                if let Some(peer) = self.peers.get_mut(session) {
-                    peer.self_muted = muted;
-                }
-            },
             WorkerCommand::SetTransmit { session, transmit } => {
                 if let Some(peer) = self.peers.get_mut(session) {
                     peer.transmit = transmit;
@@ -520,8 +492,16 @@ impl Worker {
         // Growing the slot pool is the server's job alone: str0m allows one
         // negotiation in flight and drops a pending offer the moment it accepts
         // an incoming one, so only one side may ever offer.
-        if alive && let Some(sdp) = peer.take_offer() {
-            if !peer.notify(ServerMessage::Offer { sdp }) {
+        //
+        // The offer travels on the data channel, so there is nothing to take until that is open. Asking before
+        // producing one rather than rolling it back leaves `wants_slots` set for the next drain to retry.
+        if alive
+            && peer.channel_ready()
+            && let Some(sdp) = peer.take_offer()
+        {
+            if !peer.notify_channel(ServerChannelMessage::Offer { sdp }) {
+                // The offer is spent either way, so the slots it would have added can never arrive.
+                warn!(%session, "dropping a peer whose renegotiation offer could not be sent");
                 alive = false;
             }
             self.touch(session);
@@ -559,6 +539,38 @@ impl Worker {
                 #[cfg(feature = "audio_dump")]
                 peer.capture(&data);
                 self.relay(session, peer, &data, now);
+            },
+            Event::ChannelOpen(id, label) => peer.on_channel_open(id, &label),
+            Event::ChannelClose(id) => peer.on_channel_close(id),
+            Event::ChannelData(data) => {
+                if Some(data.id) != peer.channel_id() {
+                    debug!(%session, id = ?data.id, "ignoring data on an unknown channel");
+                    return true;
+                }
+
+                let Ok(message) = serde_json::from_slice::<ClientChannelMessage>(&data.data) else {
+                    debug!(%session, ?data, "ignoring an unparseable data channel message");
+                    return true;
+                };
+
+                match message {
+                    ClientChannelMessage::Answer { sdp } => match peer.accept_answer(&sdp) {
+                        Ok(()) => self.touch(session),
+                        // Nothing was in flight, so nothing was lost: a late or duplicated answer costs us only
+                        // this log line.
+                        Err(AnswerError::Unexpected) => debug!(%session, "ignoring an answer to no offer"),
+                        // The offer is already spent, so the slots it would have added can never arrive and this
+                        // peer would silently stop hearing anyone new.
+                        Err(err) => {
+                            warn!(%session, ?err, "answer rejected");
+                            return false;
+                        },
+                    },
+                    ClientChannelMessage::Mute { muted } => {
+                        debug!(%session, muted, "browser changed its own mute");
+                        peer.self_muted = muted;
+                    },
+                }
             },
             Event::SenderFeedback(_) | Event::StreamPaused(_) => {},
             other => debug!(%session, ?other, "unhandled event"),

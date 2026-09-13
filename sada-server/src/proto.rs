@@ -1,4 +1,9 @@
-//! Signaling protocol spoken with the browser over the WebSocket.
+//! Signaling protocol spoken with the browser.
+//!
+//! Two transports, one version. The WebSocket opens the session and ends it: the handshake, and the refusal or the
+//! goodbye that closes it. The WebRTC data channel carries the session itself, and is where anything added later
+//! belongs. It lands in the worker that already owns the peer's `Rtc`, with no task to hop through and no command
+//! to define, which the WebSocket cannot say of anything it carries.
 
 use sada_common::{AuthCode, Ckey, SessionId};
 use serde::{Deserialize, Serialize};
@@ -27,18 +32,6 @@ pub enum ClientMessage {
         /// Session description.
         sdp: String,
     },
-    /// Answer to an offer the server sent.
-    Answer {
-        /// Session description.
-        sdp: String,
-    },
-    /// The client muted or unmuted itself.
-    ///
-    /// The client already stops sending, this lets the server stop relaying immediately and tell the game.
-    Mute {
-        /// Whether the microphone is now muted.
-        muted: bool,
-    },
     /// Graceful disconnect.
     Bye,
 }
@@ -65,11 +58,6 @@ pub enum ServerMessage {
         /// Identifier assigned to this session.
         session: SessionId,
     },
-    /// Offer asking the client to accept more incoming audio slots.
-    Offer {
-        /// Session description.
-        sdp: String,
-    },
     /// Who is currently audible to this client.
     Speaking {
         /// Sessions currently being heard.
@@ -86,6 +74,36 @@ pub enum ServerMessage {
     Bye {
         /// Why the session ended.
         reason: String,
+    },
+}
+
+/// A message sent by the browser through the WebRTC channel.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ClientChannelMessage {
+    /// Answer to an offer the server sent.
+    Answer {
+        /// Session description.
+        sdp: String,
+    },
+    /// The client muted or unmuted itself.
+    ///
+    /// The client already stops sending; this lets the server stop relaying immediately rather than at the end of
+    /// the talkspurt.
+    Mute {
+        /// Whether the microphone is now muted.
+        muted: bool,
+    },
+}
+
+/// A message sent by the server through the WebRTC channel.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ServerChannelMessage {
+    /// Offer asking the client to accept more incoming audio slots.
+    Offer {
+        /// Session description.
+        sdp: String,
     },
 }
 
@@ -121,7 +139,7 @@ impl ServerMessage {
 mod tests {
     use sada_common::SessionId;
 
-    use super::{ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerMessage};
+    use super::*;
 
     #[test]
     fn hello_accepts_an_absent_auth_code() {
@@ -161,8 +179,6 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 auth_code: Some("AB12CD".into()),
             },
-            ClientMessage::Answer { sdp: "v=0".to_owned() },
-            ClientMessage::Mute { muted: true },
             ClientMessage::Bye,
         ] {
             let json = serde_json::to_string(&message).unwrap();
@@ -192,5 +208,26 @@ mod tests {
             let json = serde_json::to_string(&message).unwrap();
             assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), message);
         }
+    }
+
+    #[test]
+    fn channel_messages_round_trip() {
+        let client = ClientChannelMessage::Answer { sdp: "v=0".to_owned() };
+        let json = serde_json::to_string(&client).unwrap();
+
+        assert_eq!(json, r#"{"type":"answer","sdp":"v=0"}"#);
+        assert_eq!(serde_json::from_str::<ClientChannelMessage>(&json).unwrap(), client);
+
+        let mute = ClientChannelMessage::Mute { muted: true };
+        let json = serde_json::to_string(&mute).unwrap();
+
+        assert_eq!(json, r#"{"type":"mute","muted":true}"#);
+        assert_eq!(serde_json::from_str::<ClientChannelMessage>(&json).unwrap(), mute);
+
+        let server = ServerChannelMessage::Offer { sdp: "v=0".to_owned() };
+        let json = serde_json::to_string(&server).unwrap();
+
+        assert_eq!(json, r#"{"type":"offer","sdp":"v=0"}"#);
+        assert_eq!(serde_json::from_str::<ServerChannelMessage>(&json).unwrap(), server);
     }
 }

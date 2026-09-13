@@ -6,6 +6,7 @@ use sada_common::{Ckey, SessionId, Transmit};
 use str0m::{
     Rtc,
     change::{SdpAnswer, SdpPendingOffer},
+    channel::ChannelId,
     media::{Direction, MediaData, MediaKind, MediaTime, Mid},
 };
 use thiserror::Error;
@@ -14,12 +15,15 @@ use tokio::sync::mpsc;
 #[cfg(feature = "audio_dump")]
 use crate::audio::AudioSink;
 use crate::{
-    proto::ServerMessage,
+    proto::{ServerChannelMessage, ServerMessage},
     sfu::{
         slots::{Grant, SlotTable},
         timeline::SlotTimeline,
     },
 };
+
+/// Label of the data channel the browser opens, and the only one the server pays attention to.
+const CHANNEL_LABEL: &str = "main";
 
 /// An SDP offer the server has sent and not yet had answered.
 struct Negotiation {
@@ -81,6 +85,8 @@ pub struct Peer {
     /// been stored.
     #[cfg(feature = "audio_dump")]
     sink: Option<AudioSink>,
+    /// The browser's data channel, absent until it opens and again if it closes.
+    channel_id: Option<ChannelId>,
 }
 
 impl Peer {
@@ -99,6 +105,7 @@ impl Peer {
             wants_slots: false,
             #[cfg(feature = "audio_dump")]
             sink: None,
+            channel_id: None,
         }
     }
 
@@ -108,6 +115,71 @@ impl Peer {
 
     /// Try to send a signaling message, reporting whether the socket is still there.
     pub fn notify(&self, message: ServerMessage) -> bool { self.signal.try_send(message).is_ok() }
+
+    /// Remember the browser's data channel, which is what the server can reach it on outside the handshake.
+    pub fn on_channel_open(&mut self, channel_id: ChannelId, label: &str) {
+        if label == CHANNEL_LABEL {
+            debug!(?channel_id, "data channel opened");
+            self.channel_id = Some(channel_id);
+        } else {
+            debug!(?channel_id, ?label, "ignoring an unknown data channel");
+        }
+    }
+
+    /// Forget the data channel, which leaves the peer connected but unable to be told anything.
+    pub fn on_channel_close(&mut self, channel_id: ChannelId) {
+        if self.channel_id == Some(channel_id) {
+            debug!(?channel_id, "data channel closed");
+            self.channel_id = None;
+        } else {
+            debug!(?channel_id, "ignoring the close of an unknown data channel");
+        }
+    }
+
+    /// The open data channel, if there is one.
+    #[must_use]
+    pub fn channel_id(&self) -> Option<ChannelId> { self.channel_id }
+
+    /// Whether there is a data channel to send on.
+    ///
+    /// Not the same as being connected: the channel opens a moment after the peer does, and may close on its own.
+    #[must_use]
+    pub fn channel_ready(&self) -> bool { self.channel_id.is_some() }
+
+    /// Try to send a message over the data channel, reporting whether it went out.
+    ///
+    /// A `false` means the message was lost; nothing is retried here and the caller decides what that is worth.
+    pub fn notify_channel(&mut self, message: ServerChannelMessage) -> bool {
+        let Some(channel_id) = self.channel_id else {
+            return false;
+        };
+
+        let Some(mut channel) = self.rtc.channel(channel_id) else {
+            debug!(?channel_id, "the data channel is gone");
+            return false;
+        };
+
+        let json = match serde_json::to_vec(&message) {
+            Ok(json) => json,
+            Err(err) => {
+                error!(?err, "failed to encode a channel message");
+                return false;
+            },
+        };
+
+        match channel.write(false, &json) {
+            Ok(true) => true,
+            // str0m refuses a write it cannot take whole rather than buffering part of it.
+            Ok(false) => {
+                warn!(len = json.len(), "the data channel had no room for a message");
+                false
+            },
+            Err(err) => {
+                warn!(?err, "the data channel write failed");
+                false
+            },
+        }
+    }
 
     /// Record a media slot the remote peer offered us.
     ///

@@ -1,8 +1,9 @@
 import { css, html, LitElement, nothing, type TemplateResult } from "lit";
-import { customElement, query, state } from "lit/decorators.js";
+import { customElement, state } from "lit/decorators.js";
 import config from "./config.json";
 import { PROTOCOL_VERSION, type ServerMessage, SignalingClient } from "./signaling.js";
-import { WebRTCManager } from "./webrtc.js";
+import { assertNever } from "./utils.js";
+import { type ServerChannelMessage, WebRTCManager } from "./webrtc.js";
 
 type ConnectionStatus = "disconnected" | "connecting" | "connected";
 
@@ -224,6 +225,7 @@ export class Sada extends LitElement {
                     this.cleanup();
                 }
             },
+            onMessage: (message) => this.onChannelMessage(message),
         });
         this.rtc = rtc;
 
@@ -269,13 +271,6 @@ export class Sada extends LitElement {
                     console.error("applyAnswer failed", e);
                 });
                 break;
-            case "offer":
-                console.debug("received negotiation offer");
-                this.rtc?.applyOffer(message.sdp).catch((e) => {
-                    console.error("applyOffer failed", e);
-                    this.cleanup();
-                });
-                break;
             case "speaking":
                 this.speaking = message.sessions;
                 break;
@@ -288,6 +283,22 @@ export class Sada extends LitElement {
                 this.error = message.reason || null;
                 this.cleanup();
                 break;
+            default:
+                assertNever(message);
+        }
+    }
+
+    private onChannelMessage(message: ServerChannelMessage): void {
+        switch (message.type) {
+            case "offer":
+                console.debug("received negotiation offer");
+                this.rtc?.applyOffer(message.sdp).catch((e) => {
+                    console.error("applyOffer failed", e);
+                    this.cleanup();
+                });
+                break;
+            default:
+                assertNever(message.type);
         }
     }
 
@@ -377,7 +388,6 @@ export class Sada extends LitElement {
     protected render(): TemplateResult {
         return html`
             <div class="container">
-                <audio class="remote-audio" autoplay playsinline></audio>
                 <h1>sada</h1>
 
                 <span class="status status-${this.connectionState}">

@@ -1,5 +1,5 @@
 /**
- * Signaling protocol spoken with server.
+ * Signaling protocol spoken with server over the WebSocket.
  *
  * The client opens with `hello`, then offers exactly once. After that only the
  * server offers: str0m allows one SDP negotiation in flight and drops a pending
@@ -13,8 +13,6 @@ export const PROTOCOL_VERSION = 1;
 export type ClientMessage =
     | { type: "hello"; protocol: number; authCode: string | null }
     | { type: "offer"; sdp: string }
-    | { type: "answer"; sdp: string }
-    | { type: "mute"; muted: boolean }
     | { type: "bye" };
 
 /** Machine-readable reason a request was refused. */
@@ -29,7 +27,6 @@ export type ErrorCode =
 export type ServerMessage =
     | { type: "welcome"; protocol: number; ckey: string | null }
     | { type: "answer"; sdp: string; session: number }
-    | { type: "offer"; sdp: string }
     | { type: "speaking"; sessions: number[] }
     | { type: "error"; code: ErrorCode; message: string }
     | { type: "bye"; reason: string };
@@ -149,10 +146,6 @@ function parseServerMessage(raw: string): ServerMessage | null {
             const session = num("session");
             if (!sdp || session === undefined) return null;
             return { type: "answer", sdp, session };
-        }
-        case "offer": {
-            const sdp = str("sdp");
-            return sdp ? { type: "offer", sdp } : null;
         }
         case "speaking": {
             const sessions = obj.sessions;
