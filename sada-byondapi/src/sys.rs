@@ -24,7 +24,7 @@ impl CByondValue {
     ///
     /// Every field is ours to fill in for this one type, so there is nothing for `ByondValue_SetNum` to do that this
     /// does not; `0x2A` is the tag BYOND reads as a number.
-    pub fn number(value: f32) -> Self {
+    pub const fn number(value: f32) -> Self {
         CByondValue {
             type_: 0x2A,
             junk1: 0,
@@ -37,14 +37,23 @@ impl CByondValue {
 
 impl std::fmt::Debug for CByondValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let data = match self.type_ {
-            0x00 => "data: NULL",
-            0x06 => &format!("data: 0x{:08X} (str)", unsafe { self.data.ref_ }),
-            0x2A => &format!("data: {} (num)", unsafe { self.data.num }),
-            _ => &format!("data: 0x{:08X} (ref)", unsafe { self.data.ref_ }),
+        let hint = match self.type_ {
+            0x00 => "NULL",
+            0x06 => "str",
+            0x2A => "num",
+            _ => "ref",
         };
 
-        write!(f, "CByondValue {{ type: 0x{:02X}, {data} }}", self.type_)
+        let lit = if self.type_ == 0x2A {
+            format_args!(" ({})", unsafe { self.data.num })
+        } else {
+            format_args!("")
+        };
+
+        f.debug_struct("CByondValue")
+            .field("type", &format_args!("0x{:02X} ({hint})", self.type_))
+            .field("data", &format_args!("0x{:08X}{lit}", unsafe { self.data.ref_ }))
+            .finish()
     }
 }
 
