@@ -1,29 +1,63 @@
 import config from "./config.json";
 import type { SignalingClient } from "./signaling";
 
-/** Label of the data channel, mirrored by `CHANNEL_LABEL` in `sada-server/src/sfu/peer.rs`. */
-const CHANNEL_LABEL = "main";
+/**
+ * Labels of the two data channels, mirrored in `sada-server/src/sfu/peer.rs`.
+ *
+ * Named for what each one promises rather than for what it happens to carry: the ordered one for anything that
+ * would break if it went missing, the other for state that is replaced by the next message rather than repaired.
+ */
+const ORDERED_CHANNEL_LABEL = "ordered";
+const UNORDERED_CHANNEL_LABEL = "unordered";
 
 export type CallEvents = {
-    onRemoteTrack: (stream: MediaStream) => void;
+    /** One incoming audio track, identified by the m-line carrying it so `positions` can be matched to it. */
+    onRemoteTrack: (mid: string, track: MediaStreamTrack) => void;
     onConnectionState: (state: RTCPeerConnectionState) => void;
-    onMessage: (message: ServerChannelMessage) => void;
+    onOrdered: (message: ServerOrderedMessage) => void;
+    onUnordered: (message: ServerUnorderedMessage) => void;
 };
 
-export type ClientChannelMessage =
+export type ClientOrderedMessage =
     | { type: "answer"; sdp: string }
     | { type: "mute"; muted: boolean };
 
-export type ServerChannelMessage = { type: "offer"; sdp: string };
+export type ServerOrderedMessage = { type: "offer"; sdp: string };
+
+/**
+ * A message from the unordered channel.
+ *
+ * Every one carries its own `seq` because the channel may deliver two out of order; the reader keeps the newest it
+ * has seen per message type and throws away anything that has been overtaken. The counter wraps, so newer is
+ * decided by distance rather than by magnitude; see `isNewer`.
+ */
+export type ServerUnorderedMessage = {
+    type: "positions";
+    seq: number;
+    speakers: AudibleSpeaker[];
+};
+
+/** One speaker the listener holds an audio slot for. */
+export type AudibleSpeaker = {
+    session: number;
+    /** The m-line carrying them, matching some `RTCRtpTransceiver.mid`. */
+    mid: string;
+    /** Absent when they are not to be placed: on the radio, on another z-level, or somewhere the game has not described. */
+    offset: Offset | null;
+};
+
+/** How far a speaker is from the listener, in tiles. */
+export type Offset = { x: number; y: number };
 
 export class WebRTCManager {
     private peerConnection: RTCPeerConnection;
     private localStream: MediaStream | null = null;
     private readonly signaling: SignalingClient;
     private readonly events: CallEvents;
-    private remoteStream: MediaStream;
     private signalingQueue: Promise<void> = Promise.resolve();
-    private readonly channel: RTCDataChannel;
+    private readonly ordered: RTCDataChannel;
+    private readonly unordered: RTCDataChannel;
+    private readonly lastSeq = new Map<string, number>();
 
     constructor(signaling: SignalingClient, events: CallEvents, iceServers?: RTCIceServer[]) {
         this.signaling = signaling;
@@ -32,36 +66,35 @@ export class WebRTCManager {
         this.peerConnection = new RTCPeerConnection({
             iceServers: iceServers ?? config.iceServers.map((url) => ({ urls: url })),
         });
-        this.remoteStream = new MediaStream();
-
         this.peerConnection.ontrack = (ev) => {
-            const tracks = ev.streams[0]?.getTracks() ?? [ev.track];
-            tracks.forEach((track) => {
-                if (!this.remoteStream.getTracks().includes(track)) {
-                    this.remoteStream.addTrack(track);
-                }
-            });
-            this.events.onRemoteTrack(this.remoteStream);
+            // The mid comes from the remote description being applied right now, so it is always set here. It is
+            // the only thing tying this track to the speaker the server names in `positions`.
+            const mid = ev.transceiver.mid;
+            if (!mid) {
+                console.error("remote track arrived with no mid", ev.track.id);
+                return;
+            }
+            this.events.onRemoteTrack(mid, ev.track);
         };
 
         this.peerConnection.onconnectionstatechange = () => {
             this.events.onConnectionState(this.peerConnection.connectionState);
         };
 
-        this.channel = this.peerConnection.createDataChannel(CHANNEL_LABEL);
+        this.ordered = this.peerConnection.createDataChannel(ORDERED_CHANNEL_LABEL);
 
-        this.channel.onmessage = (event) => {
+        this.ordered.onmessage = (event) => {
             const msg =
-                typeof event.data === "string" ? parseServerChannelMessage(event.data) : null;
+                typeof event.data === "string" ? parseServerOrderedMessage(event.data) : null;
             if (!msg) {
-                console.error("Failed to parse channel message", event.data);
+                console.error("Failed to parse ordered channel message", event.data);
                 return;
             }
-            this.events.onMessage(msg);
+            this.events.onOrdered(msg);
         };
 
-        this.channel.onopen = () => {
-            console.debug("data channel opened");
+        this.ordered.onopen = () => {
+            console.debug("ordered channel opened");
             // A mute pressed before the channel was up never reached the server.
             if (this.isMuted()) {
                 this.sendMessage({ type: "mute", muted: true });
@@ -70,12 +103,47 @@ export class WebRTCManager {
 
         // Losing the channel is not the end of the call, but it is the end of renegotiation: the server can no
         // longer ask us to take more speakers, and nothing else says so out loud.
-        this.channel.onclose = () => {
-            console.warn("data channel closed; no more audio slots can be added");
+        this.ordered.onclose = () => {
+            console.warn("ordered channel closed; no more audio slots can be added");
         };
 
-        this.channel.onerror = (event) => {
-            console.error("data channel error", event);
+        this.ordered.onerror = (event) => {
+            console.error("ordered channel error", event);
+        };
+
+        this.unordered = this.peerConnection.createDataChannel(UNORDERED_CHANNEL_LABEL, {
+            ordered: false,
+            maxRetransmits: 0,
+        });
+
+        this.unordered.onmessage = (event) => {
+            const msg =
+                typeof event.data === "string" ? parseServerUnorderedMessage(event.data) : null;
+            if (!msg) {
+                console.error("Failed to parse unordered channel message", event.data);
+                return;
+            }
+
+            const seen = this.lastSeq.get(msg.type);
+            if (seen !== undefined && !isNewer(msg.seq, seen)) {
+                console.debug("dropping an overtaken message", msg.type, msg.seq, seen);
+                return;
+            }
+
+            this.lastSeq.set(msg.type, msg.seq);
+            this.events.onUnordered(msg);
+        };
+
+        this.unordered.onopen = () => {
+            console.debug("unordered channel opened");
+        };
+
+        this.unordered.onclose = () => {
+            console.warn("unordered channel closed; positions will stop updating");
+        };
+
+        this.unordered.onerror = (event) => {
+            console.error("unordered channel error", event);
         };
     }
 
@@ -123,7 +191,7 @@ export class WebRTCManager {
         return this.enqueueSignaling(async () => {
             // Checked before the connection is touched: an answer we cannot send would leave our local
             // description ahead of the server's, with no way to tell it so.
-            if (this.channel.readyState !== "open") {
+            if (this.ordered.readyState !== "open") {
                 throw new Error("data channel is not open; cannot answer an offer");
             }
 
@@ -142,11 +210,11 @@ export class WebRTCManager {
         });
     }
 
-    private sendMessage(msg: ClientChannelMessage): void {
-        if (this.channel.readyState !== "open") {
+    private sendMessage(msg: ClientOrderedMessage): void {
+        if (this.ordered.readyState !== "open") {
             throw new Error("data channel is not open; cannot send message");
         }
-        this.channel.send(JSON.stringify(msg));
+        this.ordered.send(JSON.stringify(msg));
     }
 
     /** Whether the microphone is muted, as the local tracks have it. */
@@ -220,7 +288,7 @@ export class WebRTCManager {
     }
 }
 
-function parseServerChannelMessage(raw: string): ServerChannelMessage | null {
+function parseServerOrderedMessage(raw: string): ServerOrderedMessage | null {
     let parsed: unknown;
 
     try {
@@ -244,4 +312,63 @@ function parseServerChannelMessage(raw: string): ServerChannelMessage | null {
         default:
             return null;
     }
+}
+
+/**
+ * Whether `seq` comes after `seen` on a counter that wraps at 2^32.
+ */
+function isNewer(seq: number, seen: number): boolean {
+    const ahead = (seq - seen) >>> 0;
+    return ahead !== 0 && ahead < 0x8000_0000;
+}
+
+function parseServerUnorderedMessage(raw: string): ServerUnorderedMessage | null {
+    let parsed: unknown;
+
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return null;
+    }
+
+    if (typeof parsed !== "object" || parsed === null) return null;
+
+    const obj = parsed as Record<string, unknown>;
+
+    switch (obj.type) {
+        case "positions": {
+            if (typeof obj.seq !== "number" || !Array.isArray(obj.speakers)) return null;
+
+            const speakers: AudibleSpeaker[] = [];
+            for (const entry of obj.speakers) {
+                const speaker = parseAudibleSpeaker(entry);
+                // One malformed entry makes the whole set untrustworthy: a missing speaker would be read as one
+                // who has stopped being audible.
+                if (!speaker) return null;
+                speakers.push(speaker);
+            }
+
+            return { type: "positions", seq: obj.seq, speakers };
+        }
+        default:
+            return null;
+    }
+}
+
+function parseAudibleSpeaker(raw: unknown): AudibleSpeaker | null {
+    if (typeof raw !== "object" || raw === null) return null;
+
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.session !== "number" || typeof obj.mid !== "string") return null;
+
+    if (obj.offset === null || obj.offset === undefined) {
+        return { session: obj.session, mid: obj.mid, offset: null };
+    }
+
+    if (typeof obj.offset !== "object") return null;
+
+    const offset = obj.offset as Record<string, unknown>;
+    if (typeof offset.x !== "number" || typeof offset.y !== "number") return null;
+
+    return { session: obj.session, mid: obj.mid, offset: { x: offset.x, y: offset.y } };
 }

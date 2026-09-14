@@ -19,6 +19,10 @@ const NO_LISTENERS: &[Ckey] = &[];
 
 /// The routing policy currently in force.
 #[derive(Debug, Default)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a snapshot is built once per batch and moved once, straight into an Arc"
+)]
 pub enum Routing {
     /// Everyone hears everyone else.
     ///
@@ -44,6 +48,8 @@ pub struct RoutingTable {
     radio: HashMap<Freq, Vec<Ckey>>,
     /// Frequencies each speaker is allowed to transmit on.
     hot: HashMap<Ckey, Vec<Freq>>,
+    /// Where each player the game has placed is standing.
+    positions: HashMap<Ckey, Position>,
 }
 
 impl RoutingTable {
@@ -75,6 +81,10 @@ impl RoutingTable {
     pub fn can_transmit_on(&self, speaker: &Ckey, channel: Freq) -> bool {
         self.hot.get(speaker).is_some_and(|hot| hot.contains(&channel))
     }
+
+    /// Where a player is standing, if the game has said.
+    #[must_use]
+    pub fn position(&self, ckey: &Ckey) -> Option<Position> { self.positions.get(ckey).copied() }
 }
 
 /// Turns game state into a routing table.
@@ -195,8 +205,13 @@ fn base_table(players: &PlayerTable) -> RoutingTable {
     let mut speakers = HashSet::new();
     let mut radio: HashMap<Freq, Vec<Ckey>> = HashMap::new();
     let mut hot: HashMap<Ckey, Vec<Freq>> = HashMap::new();
+    let mut positions = HashMap::new();
 
     for (ckey, state) in players.iter() {
+        if let Some(position) = state.position {
+            positions.insert(ckey.clone(), position);
+        }
+
         if state.can_speak() {
             speakers.insert(ckey.clone());
             if !state.hot_freqs.is_empty() {
@@ -218,6 +233,7 @@ fn base_table(players: &PlayerTable) -> RoutingTable {
         local: HashMap::new(),
         radio,
         hot,
+        positions,
     }
 }
 

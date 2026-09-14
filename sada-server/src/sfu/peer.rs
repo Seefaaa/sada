@@ -1,8 +1,13 @@
 //! One connected browser, and everything the worker knows about it.
 
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    time::{Duration, Instant},
+};
 
 use sada_common::{Ckey, SessionId, Transmit};
+use serde::Serialize;
 use str0m::{
     Rtc,
     change::{SdpAnswer, SdpPendingOffer},
@@ -15,15 +20,88 @@ use tokio::sync::mpsc;
 #[cfg(feature = "audio_dump")]
 use crate::audio::AudioSink;
 use crate::{
-    proto::{ServerChannelMessage, ServerMessage},
+    proto::{AudibleSpeaker, Offset, ServerMessage, ServerOrderedMessage, ServerUnorderedMessage},
     sfu::{
         slots::{Grant, SlotTable},
         timeline::SlotTimeline,
     },
 };
 
-/// Label of the data channel the browser opens, and the only one the server pays attention to.
-const CHANNEL_LABEL: &str = "main";
+/// Label of the channel that keeps its promises, and the only one the browser may send on.
+const ORDERED_CHANNEL_LABEL: &str = "ordered";
+
+/// Label of the channel that keeps none of them.
+const UNORDERED_CHANNEL_LABEL: &str = "unordered";
+
+/// How long a peer may go without a position update before one is sent whether anything changed or not.
+///
+/// Positions travel on a channel that drops messages rather than repairing them, so one that goes missing is only
+/// corrected by the next send. Without a floor, a speaker who has stopped moving would stay wherever the lost
+/// message left them for as long as they stand still.
+pub const POSITION_REFRESH: Duration = Duration::from_secs(5);
+
+/// One speaker a listener can hear, as the worker tracks it.
+///
+/// Kept apart from [`AudibleSpeaker`], the shape that goes on the wire, so that comparing one round against the last
+/// allocates nothing: a [`Mid`] is [`Copy`], the string it is sent as is not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Audible {
+    /// Session occupying the slot.
+    pub session: SessionId,
+    /// The m-line carrying them.
+    pub mid: Mid,
+    /// Where they are relative to the listener, absent when they cannot be placed.
+    pub offset: Option<Offset>,
+}
+
+impl From<&Audible> for AudibleSpeaker {
+    fn from(audible: &Audible) -> Self {
+        Self {
+            session: audible.session,
+            mid: audible.mid.to_string(),
+            offset: audible.offset,
+        }
+    }
+}
+
+/// What a peer was last told about positions, and when.
+#[derive(Default)]
+struct PositionState {
+    /// The set as it was last sent, in session order.
+    last: Vec<Audible>,
+    /// When that went out. `None` until the first one does.
+    sent: Option<Instant>,
+}
+
+impl PositionState {
+    /// Whether `next` is worth sending.
+    ///
+    /// Being unchanged is not enough to stay quiet, hence [`POSITION_REFRESH`]. `next` is expected in session
+    /// order, which is what lets an unchanged set compare equal however the slot table happens to iterate.
+    fn needs(&self, next: &[Audible], now: Instant) -> bool {
+        self.last != next
+            || self
+                .sent
+                .is_none_or(|sent| now.duration_since(sent) >= POSITION_REFRESH)
+    }
+
+    /// Remember what was just sent, so the next round can tell whether anything moved.
+    fn record(&mut self, next: Vec<Audible>, now: Instant) {
+        self.last = next;
+        self.sent = Some(now);
+    }
+}
+
+/// The browser's data channels, named for what each one guarantees.
+///
+/// Either may be absent: they open a moment after the peer connects, and can close on their own.
+#[derive(Default)]
+struct Channels {
+    /// Ordered and reliable. Renegotiation and mute.
+    ordered: Option<ChannelId>,
+    /// Unordered, with no retransmits. Nothing on it may be state the receiver has to accumulate.
+    unordered: Option<ChannelId>,
+}
 
 /// An SDP offer the server has sent and not yet had answered.
 struct Negotiation {
@@ -85,8 +163,12 @@ pub struct Peer {
     /// been stored.
     #[cfg(feature = "audio_dump")]
     sink: Option<AudioSink>,
-    /// The browser's data channel, absent until it opens and again if it closes.
-    channel_id: Option<ChannelId>,
+    /// The browser's data channels.
+    channels: Channels,
+    /// What this peer was last told about where the speakers it hears are standing.
+    positions: PositionState,
+    /// Scratch space for encoding an outgoing channel message, reused from one send to the next.
+    send_on_buffer: Vec<u8>,
 }
 
 impl Peer {
@@ -105,7 +187,9 @@ impl Peer {
             wants_slots: false,
             #[cfg(feature = "audio_dump")]
             sink: None,
-            channel_id: None,
+            channels: Channels::default(),
+            positions: PositionState::default(),
+            send_on_buffer: Vec::new(),
         }
     }
 
@@ -116,70 +200,113 @@ impl Peer {
     /// Try to send a signaling message, reporting whether the socket is still there.
     pub fn notify(&self, message: ServerMessage) -> bool { self.signal.try_send(message).is_ok() }
 
-    /// Remember the browser's data channel, which is what the server can reach it on outside the handshake.
+    /// Remember one of the browser's data channels, which is how the server reaches it outside the handshake.
     pub fn on_channel_open(&mut self, channel_id: ChannelId, label: &str) {
-        if label == CHANNEL_LABEL {
-            debug!(?channel_id, "data channel opened");
-            self.channel_id = Some(channel_id);
-        } else {
-            debug!(?channel_id, ?label, "ignoring an unknown data channel");
-        }
+        let slot = match label {
+            ORDERED_CHANNEL_LABEL => &mut self.channels.ordered,
+            UNORDERED_CHANNEL_LABEL => &mut self.channels.unordered,
+            _ => {
+                debug!(?channel_id, ?label, "ignoring an unknown data channel");
+                return;
+            },
+        };
+
+        *slot = Some(channel_id);
+
+        debug!(?channel_id, ?label, "data channel opened");
     }
 
-    /// Forget the data channel, which leaves the peer connected but unable to be told anything.
+    /// Forget a data channel, which leaves the peer connected but no longer reachable that way.
     pub fn on_channel_close(&mut self, channel_id: ChannelId) {
-        if self.channel_id == Some(channel_id) {
-            debug!(?channel_id, "data channel closed");
-            self.channel_id = None;
+        let slot = if self.channels.ordered == Some(channel_id) {
+            &mut self.channels.ordered
+        } else if self.channels.unordered == Some(channel_id) {
+            &mut self.channels.unordered
         } else {
             debug!(?channel_id, "ignoring the close of an unknown data channel");
-        }
+            return;
+        };
+
+        *slot = None;
+
+        debug!(?channel_id, "data channel closed");
     }
 
-    /// The open data channel, if there is one.
+    /// The open ordered channel, if there is one.
     #[must_use]
-    pub fn channel_id(&self) -> Option<ChannelId> { self.channel_id }
+    pub fn ordered_channel(&self) -> Option<ChannelId> { self.channels.ordered }
 
-    /// Whether there is a data channel to send on.
+    /// Whether there is an ordered channel to send on.
     ///
     /// Not the same as being connected: the channel opens a moment after the peer does, and may close on its own.
     #[must_use]
-    pub fn channel_ready(&self) -> bool { self.channel_id.is_some() }
+    pub fn ordered_ready(&self) -> bool { self.channels.ordered.is_some() }
 
-    /// Try to send a message over the data channel, reporting whether it went out.
+    /// Try to send a message that must arrive, reporting whether it went out.
     ///
     /// A `false` means the message was lost; nothing is retried here and the caller decides what that is worth.
-    pub fn notify_channel(&mut self, message: ServerChannelMessage) -> bool {
-        let Some(channel_id) = self.channel_id else {
+    pub fn notify_ordered(&mut self, message: ServerOrderedMessage) -> bool {
+        self.send_on(self.channels.ordered, &message)
+    }
+
+    /// Try to send a message that is free to go missing, reporting whether it went out.
+    ///
+    /// Losing one is not worth repairing, which is what the channel is for, but the caller still has to know: a send
+    /// recorded as having happened is one the next round will not retry.
+    pub fn notify_unordered(&mut self, message: &ServerUnorderedMessage) -> bool {
+        self.send_on(self.channels.unordered, message)
+    }
+
+    /// Write one JSON message to a channel, reporting whether the peer took it.
+    fn send_on(&mut self, channel_id: Option<ChannelId>, message: &impl Serialize) -> bool {
+        let Some(channel_id) = channel_id else {
             return false;
         };
+
+        let mut writer = Cursor::new(&mut self.send_on_buffer);
+
+        if let Err(err) = serde_json::to_writer(&mut writer, message) {
+            error!(?err, "failed to encode a channel message");
+            return false;
+        }
+
+        let length = writer.position() as usize;
+        let data = &self.send_on_buffer[..length];
 
         let Some(mut channel) = self.rtc.channel(channel_id) else {
             debug!(?channel_id, "the data channel is gone");
             return false;
         };
 
-        let json = match serde_json::to_vec(&message) {
-            Ok(json) => json,
-            Err(err) => {
-                error!(?err, "failed to encode a channel message");
-                return false;
-            },
-        };
-
-        match channel.write(false, &json) {
+        match channel.write(false, data) {
             Ok(true) => true,
             // str0m refuses a write it cannot take whole rather than buffering part of it.
             Ok(false) => {
-                warn!(len = json.len(), "the data channel had no room for a message");
+                warn!(
+                    ?channel_id,
+                    len = data.len(),
+                    "the data channel had no room for a message"
+                );
                 false
             },
             Err(err) => {
-                warn!(?err, "the data channel write failed");
+                warn!(?channel_id, ?err, "the data channel write failed");
                 false
             },
         }
     }
+
+    /// Every speaker this peer currently holds a slot for, with the m-line carrying them.
+    pub fn audible(&self) -> impl Iterator<Item = (SessionId, Mid)> {
+        self.slots.assignments().map(|(speaker, mid)| (speaker, *mid))
+    }
+
+    /// Whether this peer should be told `speakers`, which must be in session order.
+    #[must_use]
+    pub fn needs_positions(&self, speakers: &[Audible], now: Instant) -> bool { self.positions.needs(speakers, now) }
+
+    /// Record the set this peer has just been told about.
+    pub fn remember_positions(&mut self, speakers: Vec<Audible>, now: Instant) { self.positions.record(speakers, now); }
 
     /// Record a media slot the remote peer offered us.
     ///
@@ -334,4 +461,98 @@ pub enum AnswerError {
     /// str0m refused the answer.
     #[error("the answer did not match the offer")]
     Rejected,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use sada_common::SessionId;
+    use str0m::media::Mid;
+
+    use super::{Audible, POSITION_REFRESH, PositionState};
+    use crate::proto::Offset;
+
+    /// One audible speaker, placed where the arguments say.
+    fn audible(session: u32, mid: &str, offset: Option<(i32, i32)>) -> Audible {
+        Audible {
+            session: SessionId::new(session, 1),
+            mid: Mid::from(mid),
+            offset: offset.map(|(x, y)| Offset { x, y }),
+        }
+    }
+
+    #[test]
+    fn the_first_round_is_always_sent() {
+        let state = PositionState::default();
+
+        // Even the empty set, which is what a peer hearing nobody would be told, and which matches the state it
+        // starts out holding.
+        assert!(state.needs(&[], Instant::now()));
+    }
+
+    #[test]
+    fn an_unchanged_set_is_not_repeated() {
+        let now = Instant::now();
+        let speakers = vec![audible(1, "0", Some((3, 4)))];
+        let mut state = PositionState::default();
+
+        state.record(speakers.clone(), now);
+
+        assert!(!state.needs(&speakers, now));
+    }
+
+    #[test]
+    fn a_moved_speaker_is_sent_again() {
+        let now = Instant::now();
+        let mut state = PositionState::default();
+
+        state.record(vec![audible(1, "0", Some((3, 4)))], now);
+
+        assert!(state.needs(&[audible(1, "0", Some((3, 5)))], now));
+    }
+
+    #[test]
+    fn a_speaker_who_became_audible_is_sent_again() {
+        let now = Instant::now();
+        let mut state = PositionState::default();
+
+        state.record(vec![audible(1, "0", None)], now);
+
+        assert!(state.needs(&[audible(1, "0", None), audible(2, "1", None)], now));
+    }
+
+    #[test]
+    fn a_speaker_who_went_away_is_sent_again() {
+        let now = Instant::now();
+        let mut state = PositionState::default();
+
+        state.record(vec![audible(1, "0", None)], now);
+
+        // The emptying is the whole message: a listener never told would go on placing a voice that has stopped.
+        assert!(state.needs(&[], now));
+    }
+
+    #[test]
+    fn an_unchanged_set_is_repeated_after_the_refresh_interval() {
+        let now = Instant::now();
+        let speakers = vec![audible(1, "0", Some((3, 4)))];
+        let mut state = PositionState::default();
+
+        state.record(speakers.clone(), now);
+
+        assert!(!state.needs(&speakers, now + POSITION_REFRESH - Duration::from_millis(1)));
+        assert!(state.needs(&speakers, now + POSITION_REFRESH));
+    }
+
+    #[test]
+    fn the_same_speaker_on_a_different_slot_is_sent_again() {
+        let now = Instant::now();
+        let mut state = PositionState::default();
+
+        state.record(vec![audible(1, "0", None)], now);
+
+        // A reclaimed slot moves the speaker to another m-line, and the browser tracks them by that.
+        assert!(state.needs(&[audible(1, "1", None)], now));
+    }
 }

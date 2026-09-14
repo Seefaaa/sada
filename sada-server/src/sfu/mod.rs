@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sada_common::{Ckey, SessionId, Transmit};
+use sada_common::{Ckey, Position, SessionId, Transmit};
 use str0m::{
     Candidate,
     Event,
@@ -39,17 +39,24 @@ use tokio::{
     net::UdpSocket,
     select,
     sync::{mpsc, oneshot},
-    time::sleep_until,
+    time::{MissedTickBehavior, interval, sleep_until},
 };
 
 use crate::{
     config::Config,
     directory::routing::Routing,
-    proto::{ClientChannelMessage, ServerChannelMessage, ServerMessage},
+    proto::{
+        AudibleSpeaker,
+        ClientOrderedMessage,
+        Offset,
+        ServerMessage,
+        ServerOrderedMessage,
+        ServerUnorderedMessage,
+    },
     sfu::{
         deadlines::Deadlines,
         demux::AddressMap,
-        peer::{AnswerError, Peer, Relay},
+        peer::{AnswerError, Audible, Peer, Relay},
         peers::Peers,
     },
     shutdown::Shutdown,
@@ -57,6 +64,12 @@ use crate::{
 
 /// Largest UDP datagram accepted.
 const BUFFER_SIZE: usize = 2048;
+
+/// How often every peer's position set is rebuilt and compared against what it was last sent.
+///
+/// How often the worker *looks*, where [`POSITION_REFRESH`](crate::sfu::peer::POSITION_REFRESH) is how often it repeats
+/// itself; a change is picked up within one of these however it came about.
+const POSITION_TICK: Duration = Duration::from_millis(100);
 
 /// How long a peer may take to connect before it is reaped.
 ///
@@ -195,6 +208,8 @@ pub struct Worker {
     dirty: HashSet<SessionId>,
     /// Current routing policy.
     routing: Arc<Routing>,
+    /// Counter stamped on each round of position updates.
+    position_seq: u32,
     /// Reverse index from player to session.
     by_ckey: HashMap<Ckey, SessionId>,
     /// Incoming commands.
@@ -265,6 +280,7 @@ impl Worker {
                         deadlines: Deadlines::new(),
                         dirty: HashSet::new(),
                         routing: Arc::new(Routing::Unrestricted),
+                        position_seq: 0,
                         by_ckey: HashMap::new(),
                         commands,
                         events,
@@ -288,6 +304,9 @@ impl Worker {
 
         let mut buf = vec![0; BUFFER_SIZE];
 
+        let mut positions = interval(POSITION_TICK);
+        positions.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         loop {
             self.drain_dirty();
             self.reap_stalled();
@@ -305,6 +324,8 @@ impl Worker {
                 },
 
                 () = sleep_until(deadline_instant(deadline)), if deadline.is_some() => self.on_deadline(),
+
+                _ = positions.tick() => self.publish_positions(),
 
                 received = self.socket.recv_from(&mut buf) => match received {
                     Ok((len, source)) => self.on_datagram(&buf[..len], source),
@@ -339,6 +360,7 @@ impl Worker {
             },
             WorkerCommand::Routing(routing) => {
                 self.routing = routing;
+                self.publish_positions();
             },
             WorkerCommand::Disconnect { session } => self.remove_peer(session, "disconnected"),
         }
@@ -496,10 +518,10 @@ impl Worker {
         // The offer travels on the data channel, so there is nothing to take until that is open. Asking before
         // producing one rather than rolling it back leaves `wants_slots` set for the next drain to retry.
         if alive
-            && peer.channel_ready()
+            && peer.ordered_ready()
             && let Some(sdp) = peer.take_offer()
         {
-            if !peer.notify_channel(ServerChannelMessage::Offer { sdp }) {
+            if !peer.notify_ordered(ServerOrderedMessage::Offer { sdp }) {
                 // The offer is spent either way, so the slots it would have added can never arrive.
                 warn!(%session, "dropping a peer whose renegotiation offer could not be sent");
                 alive = false;
@@ -543,21 +565,20 @@ impl Worker {
             Event::ChannelOpen(id, label) => peer.on_channel_open(id, &label),
             Event::ChannelClose(id) => peer.on_channel_close(id),
             Event::ChannelData(data) => {
-                if Some(data.id) != peer.channel_id() {
+                if Some(data.id) != peer.ordered_channel() {
                     debug!(%session, id = ?data.id, "ignoring data on an unknown channel");
                     return true;
                 }
 
-                let Ok(message) = serde_json::from_slice::<ClientChannelMessage>(&data.data) else {
+                let Ok(message) = serde_json::from_slice(&data.data) else {
                     debug!(%session, ?data, "ignoring an unparseable data channel message");
                     return true;
                 };
 
                 match message {
-                    ClientChannelMessage::Answer { sdp } => match peer.accept_answer(&sdp) {
+                    ClientOrderedMessage::Answer { sdp } => match peer.accept_answer(&sdp) {
                         Ok(()) => self.touch(session),
-                        // Nothing was in flight, so nothing was lost: a late or duplicated answer costs us only
-                        // this log line.
+                        // Nothing was in flight, so nothing was lost; migt be a late or duplicated answer
                         Err(AnswerError::Unexpected) => debug!(%session, "ignoring an answer to no offer"),
                         // The offer is already spent, so the slots it would have added can never arrive and this
                         // peer would silently stop hearing anyone new.
@@ -566,7 +587,7 @@ impl Worker {
                             return false;
                         },
                     },
-                    ClientChannelMessage::Mute { muted } => {
+                    ClientOrderedMessage::Mute { muted } => {
                         debug!(%session, muted, "browser changed its own mute");
                         peer.self_muted = muted;
                     },
@@ -596,6 +617,75 @@ impl Worker {
                 Relay::NotConnected | Relay::Rejected | Relay::Unheard => {},
             }
         }
+    }
+
+    /// Tell each peer where the speakers it can hear are standing, when that has changed or gone stale.
+    fn publish_positions(&mut self) {
+        let now = Instant::now();
+
+        self.position_seq = self.position_seq.wrapping_add(1);
+
+        for session in self.peers.ids() {
+            let Some(mut peer) = self.peers.take(session) else {
+                continue;
+            };
+
+            let speakers = self.speakers_for(&peer);
+
+            if peer.needs_positions(&speakers, now) {
+                let sent = peer.notify_unordered(&ServerUnorderedMessage::Positions {
+                    seq: self.position_seq,
+                    speakers: speakers.iter().map(AudibleSpeaker::from).collect(),
+                });
+
+                if sent {
+                    peer.remember_positions(speakers, now);
+                    self.touch(session);
+                }
+            }
+
+            self.peers.restore(session, peer);
+        }
+    }
+
+    /// Describe the speakers a listener holds a slot for, relative to the listener, in session order.
+    fn speakers_for(&self, listener: &Peer) -> Vec<Audible> {
+        let table = match self.routing.as_ref() {
+            Routing::Explicit(table) => Some(table),
+            Routing::Unrestricted => None,
+        };
+
+        let here = table
+            .zip(listener.ckey.as_ref())
+            .and_then(|(table, ckey)| table.position(ckey));
+
+        let mut speakers = listener
+            .audible()
+            .map(|(session, mid)| {
+                let there = table
+                    .zip(self.peers.get(session).and_then(|speaker| speaker.ckey.as_ref()))
+                    .and_then(|(table, ckey)| table.position(ckey));
+
+                let on_radio = matches!(
+                    self.peers.get(session).and_then(|speaker| speaker.transmit),
+                    Some(Transmit::Radio(_))
+                );
+
+                Audible {
+                    session,
+                    mid,
+                    offset: (!on_radio)
+                        .then(|| here.zip(there).and_then(|(here, there)| offset(here, there)))
+                        .flatten(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // The slot table is a HashMap, so the same set can come out in a different order from one round to the
+        // next. Sorting is what lets an unchanged set compare equal, and it settles the order on the wire too.
+        speakers.sort_unstable_by_key(|speaker| speaker.session);
+
+        speakers
     }
 
     /// Resolve who should hear a speaker right now.
@@ -743,6 +833,14 @@ fn accept_offer(local_addr: SocketAddr, offer: SdpOffer) -> Result<(Rtc, String)
     })?;
 
     Ok((rtc, answer.to_sdp_string()))
+}
+
+/// How far `there` is from `here`, or `None` when the two cannot be compared.
+fn offset(here: Position, there: Position) -> Option<Offset> {
+    (here.z == there.z).then(|| Offset {
+        x: there.x - here.x,
+        y: there.y - here.y,
+    })
 }
 
 /// Whether a peer has taken too long to connect.

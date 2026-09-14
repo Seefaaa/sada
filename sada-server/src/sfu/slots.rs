@@ -139,6 +139,15 @@ impl<S: Copy> SlotTable<S> {
         Some(assignment.slot)
     }
 
+    /// Every speaker currently holding a slot, with the slot they hold.
+    ///
+    /// A speaker who has gone quiet is still here, because the slot is theirs until somebody else needs it.
+    pub fn assignments(&self) -> impl Iterator<Item = (SessionId, &S)> {
+        self.assigned
+            .iter()
+            .map(|(speaker, assignment)| (*speaker, &assignment.slot))
+    }
+
     /// Total number of slots this peer has negotiated.
     #[must_use]
     pub fn capacity(&self) -> usize { self.assigned.len() + self.available.len() }

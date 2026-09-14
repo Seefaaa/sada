@@ -27,7 +27,6 @@ export type ErrorCode =
 export type ServerMessage =
     | { type: "welcome"; protocol: number; ckey: string | null }
     | { type: "answer"; sdp: string; session: number }
-    | { type: "speaking"; sessions: number[] }
     | { type: "error"; code: ErrorCode; message: string }
     | { type: "bye"; reason: string };
 
@@ -146,13 +145,6 @@ function parseServerMessage(raw: string): ServerMessage | null {
             const session = num("session");
             if (!sdp || session === undefined) return null;
             return { type: "answer", sdp, session };
-        }
-        case "speaking": {
-            const sessions = obj.sessions;
-            if (!Array.isArray(sessions) || sessions.some((s) => typeof s !== "number")) {
-                return null;
-            }
-            return { type: "speaking", sessions: sessions as number[] };
         }
         case "error": {
             const code = str("code");

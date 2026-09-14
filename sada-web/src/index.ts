@@ -3,9 +3,22 @@ import { customElement, state } from "lit/decorators.js";
 import config from "./config.json";
 import { PROTOCOL_VERSION, type ServerMessage, SignalingClient } from "./signaling.js";
 import { assertNever } from "./utils.js";
-import { type ServerChannelMessage, WebRTCManager } from "./webrtc.js";
+import {
+    type AudibleSpeaker,
+    type ServerOrderedMessage,
+    type ServerUnorderedMessage,
+    WebRTCManager,
+} from "./webrtc.js";
 
 type ConnectionStatus = "disconnected" | "connecting" | "connected";
+
+/** Everything one speaker's audio passes through on its way to the listener. */
+type SpeakerAudio = {
+    source: MediaStreamAudioSourceNode;
+    panner: PannerNode;
+    /** Silent element the track is also attached to, which is what makes Chrome deliver it to WebAudio at all. */
+    sink: HTMLAudioElement;
+};
 
 @customElement("sada-app")
 export class Sada extends LitElement {
@@ -144,7 +157,7 @@ export class Sada extends LitElement {
             box-sizing: border-box;
         }
 
-        .speaking {
+        .audible {
             font-size: 0.8125rem;
             min-height: 1.2em;
             color: light-dark(#065f46, #6ee7b7);
@@ -164,7 +177,7 @@ export class Sada extends LitElement {
     private session: number | null = null;
 
     @state()
-    private speaking: number[] = [];
+    private audible: number[] = [];
 
     @state()
     private error: string | null = null;
@@ -175,12 +188,18 @@ export class Sada extends LitElement {
     private signalling?: SignalingClient;
     private rtc?: WebRTCManager;
 
-    @query("audio.remote-audio")
-    private remoteAudio?: HTMLAudioElement;
+    private audioContext = new AudioContext();
+
+    /** One entry per incoming m-line, keyed the way `positions` names them. */
+    private speakerAudio = new Map<string, SpeakerAudio>();
 
     private async tryConnect(): Promise<void> {
         this.error = null;
         this.connectionState = "connecting";
+
+        // Browsers start an AudioContext suspended until a user gesture, and this runs inside the click that asked
+        // to connect. Without it the whole graph is built and silent.
+        await this.audioContext.resume().catch((e) => console.error("could not resume audio", e));
 
         const url = config.signalingUrl.replace("{hostname}", location.hostname);
         const signaling = new SignalingClient(url, {
@@ -217,7 +236,7 @@ export class Sada extends LitElement {
         const signaling = this.signalling!;
 
         const rtc = new WebRTCManager(signaling, {
-            onRemoteTrack: (stream) => this.attachRemoteStream(stream),
+            onRemoteTrack: (mid, track) => this.attachRemoteTrack(mid, track),
             onConnectionState: (state) => {
                 if (state === "connected") {
                     this.connectionState = "connected";
@@ -225,7 +244,8 @@ export class Sada extends LitElement {
                     this.cleanup();
                 }
             },
-            onMessage: (message) => this.onChannelMessage(message),
+            onOrdered: (message) => this.onOrderedMessage(message),
+            onUnordered: (message) => this.onUnorderedMessage(message),
         });
         this.rtc = rtc;
 
@@ -239,16 +259,75 @@ export class Sada extends LitElement {
         }
     }
 
-    private attachRemoteStream(stream: MediaStream): void {
-        if (!this.remoteAudio) {
+    /**
+     * Give one speaker their own place in the room.
+     *
+     * Each incoming m-line gets its own chain, because the m-line is what the server names a speaker by and what it
+     * moves them around on.
+     */
+    private attachRemoteTrack(mid: string, track: MediaStreamTrack): void {
+        // A slot can be handed to a different speaker, and a renegotiation can raise the same m-line again.
+        this.detachRemoteTrack(mid);
+
+        const stream = new MediaStream([track]);
+
+        // Chrome will not pump a remote stream through a MediaStreamAudioSourceNode unless it is also attached to a
+        // media element. The reference is kept so it is not collected.
+        const sink = new Audio();
+        sink.srcObject = stream;
+        sink.muted = true;
+        sink.play().catch((e) => console.error("audio sink failed to start", e));
+
+        const source = this.audioContext.createMediaStreamSource(stream);
+        const panner = new PannerNode(this.audioContext, {
+            panningModel: "equalpower",
+            distanceModel: "inverse",
+            refDistance: 1,
+            maxDistance: 10_000,
+            rolloffFactor: 1,
+            coneInnerAngle: 360,
+            coneOuterAngle: 0,
+            coneOuterGain: 0,
+        });
+
+        source.connect(panner);
+        panner.connect(this.audioContext.destination);
+
+        this.speakerAudio.set(mid, { source, panner, sink });
+    }
+
+    /** Tear one speaker's chain down, leaving nothing connected to the destination. */
+    private detachRemoteTrack(mid: string): void {
+        const audio = this.speakerAudio.get(mid);
+
+        if (!audio) {
             return;
         }
 
-        if (this.remoteAudio.srcObject !== stream) {
-            this.remoteAudio.srcObject = stream;
-        }
+        audio.source.disconnect();
+        audio.panner.disconnect();
+        audio.sink.srcObject = null;
+        this.speakerAudio.delete(mid);
+    }
 
-        this.remoteAudio.play().catch((e) => console.error("remote audio play failed", e));
+    /**
+     * Put each speaker where the server says they are.
+     *
+     * The game's axes are not the listener's: east is the panner's x, but north is *forward*, which is negative z.
+     * Putting north on y would raise the speaker over the listener's head instead.
+     */
+    private placeSpeakers(speakers: AudibleSpeaker[]): void {
+        for (const speaker of speakers) {
+            const audio = this.speakerAudio.get(speaker.mid);
+
+            if (!audio) continue;
+
+            // No offset means do not place them at all: on the radio, on another z-level, or somewhere the game has
+            // not described. The centre is the honest answer for all three.
+            audio.panner.positionX.value = speaker.offset?.x ?? 0;
+            audio.panner.positionY.value = speaker.offset?.y ?? 0;
+            // audio.panner.positionZ.value = 0;
+        }
     }
 
     private onMessage(message: ServerMessage): void {
@@ -271,9 +350,6 @@ export class Sada extends LitElement {
                     console.error("applyAnswer failed", e);
                 });
                 break;
-            case "speaking":
-                this.speaking = message.sessions;
-                break;
             case "error":
                 console.error("server error", message.code, message.message);
                 this.error = message.message;
@@ -288,7 +364,7 @@ export class Sada extends LitElement {
         }
     }
 
-    private onChannelMessage(message: ServerChannelMessage): void {
+    private onOrderedMessage(message: ServerOrderedMessage): void {
         switch (message.type) {
             case "offer":
                 console.debug("received negotiation offer");
@@ -302,18 +378,29 @@ export class Sada extends LitElement {
         }
     }
 
+    private onUnorderedMessage(message: ServerUnorderedMessage): void {
+        switch (message.type) {
+            case "positions":
+                this.audible = message.speakers.map((speaker) => speaker.session);
+                this.placeSpeakers(message.speakers);
+                break;
+            default:
+                assertNever(message.type);
+        }
+    }
+
     private cleanup(): void {
         this.signalling?.close();
         this.signalling = undefined;
         this.rtc?.hangup();
         this.rtc = undefined;
-        if (this.remoteAudio) {
-            this.remoteAudio.srcObject = null;
+        for (const mid of [...this.speakerAudio.keys()]) {
+            this.detachRemoteTrack(mid);
         }
         this.muted = false;
         this.session = null;
         this.ckey = null;
-        this.speaking = [];
+        this.audible = [];
         this.connectionState = "disconnected";
     }
 
@@ -399,8 +486,8 @@ export class Sada extends LitElement {
 
                 <div class="controls">${this.connectionStateTemplate()}</div>
 
-                <span class="speaking">
-                    ${this.speaking.length > 0 ? `Speaking: ${this.speaking.join(", ")}` : nothing}
+                <span class="audible">
+                    ${this.audible.length > 0 ? `Audible: ${this.audible.join(", ")}` : nothing}
                 </span>
             </div>
         `;

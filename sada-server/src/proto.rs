@@ -58,11 +58,6 @@ pub enum ServerMessage {
         /// Identifier assigned to this session.
         session: SessionId,
     },
-    /// Who is currently audible to this client.
-    Speaking {
-        /// Sessions currently being heard.
-        sessions: Vec<SessionId>,
-    },
     /// The request could not be handled.
     Error {
         /// Machine-readable reason.
@@ -77,10 +72,10 @@ pub enum ServerMessage {
     },
 }
 
-/// A message sent by the browser through the WebRTC channel.
+/// A message sent by the browser through the ordered channel.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
-pub enum ClientChannelMessage {
+pub enum ClientOrderedMessage {
     /// Answer to an offer the server sent.
     Answer {
         /// Session description.
@@ -96,15 +91,57 @@ pub enum ClientChannelMessage {
     },
 }
 
-/// A message sent by the server through the WebRTC channel.
+/// A message sent by the server through the ordered channel.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
-pub enum ServerChannelMessage {
+pub enum ServerOrderedMessage {
     /// Offer asking the client to accept more incoming audio slots.
     Offer {
         /// Session description.
         sdp: String,
     },
+}
+
+/// A message sent by the server through the unordered channel.
+///
+/// That channel may drop a message or deliver two out of order, which puts two rules on everything carried here: it
+/// is the whole state and never a delta, and it carries its own `seq` so the receiver can throw away one that a
+/// newer message of the same kind has already overtaken. The sequence belongs to the message rather than to the
+/// channel because a second kind of message must not be able to suppress the first.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ServerUnorderedMessage {
+    /// Where the speakers this listener can hear are standing, relative to the listener.
+    Positions {
+        /// Increases with every round of updates, and wraps.
+        seq: u32,
+        /// One entry per outgoing audio slot this listener holds, empty when it holds none.
+        speakers: Vec<AudibleSpeaker>,
+    },
+}
+
+/// One speaker a listener is set up to hear.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AudibleSpeaker {
+    /// Session occupying the slot.
+    pub session: SessionId,
+    /// The m-line carrying them, which is how the browser finds the matching track through `transceiver.mid`.
+    pub mid: String,
+    /// Where they are, absent when they are not to be placed at all.
+    ///
+    /// Three things leave it empty: either side is somewhere the game has not described, the two are on different
+    /// z-levels, or the speaker is on the radio rather than in the room.
+    pub offset: Option<Offset>,
+}
+
+/// How far away a speaker is, in tiles, from the listener being told.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct Offset {
+    /// Tiles east.
+    pub x: i32,
+    /// Tiles north.
+    pub y: i32,
 }
 
 /// Machine-readable failure reason.
@@ -197,9 +234,6 @@ mod tests {
                 sdp: "v=0".to_owned(),
                 session: SessionId::new(1, 1),
             },
-            ServerMessage::Speaking {
-                sessions: vec![SessionId::new(1, 1), SessionId::new(2, 1)],
-            },
             ServerMessage::error(ErrorCode::BadAuthCode, "unknown code"),
             ServerMessage::Bye {
                 reason: "shutting down".to_owned(),
@@ -212,22 +246,62 @@ mod tests {
 
     #[test]
     fn channel_messages_round_trip() {
-        let client = ClientChannelMessage::Answer { sdp: "v=0".to_owned() };
+        let client = ClientOrderedMessage::Answer { sdp: "v=0".to_owned() };
         let json = serde_json::to_string(&client).unwrap();
 
         assert_eq!(json, r#"{"type":"answer","sdp":"v=0"}"#);
-        assert_eq!(serde_json::from_str::<ClientChannelMessage>(&json).unwrap(), client);
+        assert_eq!(serde_json::from_str::<ClientOrderedMessage>(&json).unwrap(), client);
 
-        let mute = ClientChannelMessage::Mute { muted: true };
+        let mute = ClientOrderedMessage::Mute { muted: true };
         let json = serde_json::to_string(&mute).unwrap();
 
         assert_eq!(json, r#"{"type":"mute","muted":true}"#);
-        assert_eq!(serde_json::from_str::<ClientChannelMessage>(&json).unwrap(), mute);
+        assert_eq!(serde_json::from_str::<ClientOrderedMessage>(&json).unwrap(), mute);
 
-        let server = ServerChannelMessage::Offer { sdp: "v=0".to_owned() };
+        let server = ServerOrderedMessage::Offer { sdp: "v=0".to_owned() };
         let json = serde_json::to_string(&server).unwrap();
 
         assert_eq!(json, r#"{"type":"offer","sdp":"v=0"}"#);
-        assert_eq!(serde_json::from_str::<ServerChannelMessage>(&json).unwrap(), server);
+        assert_eq!(serde_json::from_str::<ServerOrderedMessage>(&json).unwrap(), server);
+    }
+
+    #[test]
+    fn positions_round_trip_with_and_without_an_offset() {
+        let message = ServerUnorderedMessage::Positions {
+            seq: 7,
+            speakers: vec![
+                AudibleSpeaker {
+                    session: SessionId::new(1, 1),
+                    mid: "0".to_owned(),
+                    offset: Some(Offset { x: -3, y: 4 }),
+                },
+                AudibleSpeaker {
+                    session: SessionId::new(2, 1),
+                    mid: "1".to_owned(),
+                    offset: None,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+
+        assert!(
+            json.contains(r#""offset":{"x":-3,"y":4}"#),
+            "unexpected encoding: {json}"
+        );
+        assert!(json.contains(r#""offset":null"#), "unexpected encoding: {json}");
+        assert_eq!(serde_json::from_str::<ServerUnorderedMessage>(&json).unwrap(), message);
+    }
+
+    #[test]
+    fn positions_carry_an_empty_set_rather_than_omitting_it() {
+        let message = ServerUnorderedMessage::Positions {
+            seq: 0,
+            speakers: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+
+        assert_eq!(json, r#"{"type":"positions","seq":0,"speakers":[]}"#);
     }
 }
