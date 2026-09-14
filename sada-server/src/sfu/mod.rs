@@ -593,7 +593,9 @@ impl Worker {
                     },
                 }
             },
-            Event::SenderFeedback(_) | Event::StreamPaused(_) => {},
+            // Routine rather than unhandled. The last of these says a channel's send queue has drained, which is
+            // backpressure we do not steer by: `Channel::write` already refuses what will not fit.
+            Event::SenderFeedback(_) | Event::StreamPaused(_) | Event::ChannelBufferedAmountLow(_) => {},
             other => debug!(%session, ?other, "unhandled event"),
         }
 
