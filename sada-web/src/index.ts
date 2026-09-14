@@ -1,14 +1,16 @@
 import { css, html, LitElement, nothing, type TemplateResult } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import config from "./config.json";
-import { PROTOCOL_VERSION, type ServerMessage, SignalingClient } from "./signaling.js";
-import { assertNever } from "./utils.js";
 import {
     type AudibleSpeaker,
+    PROTOCOL_VERSION,
+    type ServerMessage,
     type ServerOrderedMessage,
     type ServerUnorderedMessage,
-    WebRTCManager,
-} from "./webrtc.js";
+} from "./schema";
+import { SignalingClient } from "./signaling";
+import { assertNever } from "./utils";
+import { WebRTCManager } from "./webrtc";
 
 type ConnectionStatus = "disconnected" | "connecting" | "connected";
 

@@ -1,34 +1,23 @@
 /**
- * Signaling protocol spoken with server over the WebSocket.
+ * The WebSocket half of the browser protocol.
  *
  * The client opens with `hello`, then offers exactly once. After that only the
  * server offers: str0m allows one SDP negotiation in flight and drops a pending
  * offer the moment it accepts an incoming one, so a client that renegotiated on
  * its own would race the server for no benefit.
+ *
+ * That renegotiation, and everything else the client has to say once the call
+ * is up, goes over the data channels instead. See `webrtc.ts`. The message
+ * shapes themselves live in `schema.ts`.
  */
 
-/** Protocol version this client was built against. */
-export const PROTOCOL_VERSION = 1;
-
-export type ClientMessage =
-    | { type: "hello"; protocol: number; authCode: string | null }
-    | { type: "offer"; sdp: string }
-    | { type: "bye" };
-
-/** Machine-readable reason a request was refused. */
-export type ErrorCode =
-    | "unsupportedProtocol"
-    | "badAuthCode"
-    | "authRequired"
-    | "unexpectedMessage"
-    | "badSdpOffer"
-    | "internal";
-
-export type ServerMessage =
-    | { type: "welcome"; protocol: number; ckey: string | null }
-    | { type: "answer"; sdp: string; session: number }
-    | { type: "error"; code: ErrorCode; message: string }
-    | { type: "bye"; reason: string };
+import {
+    type ClientMessage,
+    PROTOCOL_VERSION,
+    parseMessage,
+    type ServerMessage,
+    serverMessageSchema,
+} from "./schema";
 
 export type SignalingHandlers = {
     onServerMessage: (msg: ServerMessage) => void;
@@ -56,11 +45,8 @@ export class SignalingClient {
                 resolve();
             };
             webSocket.onmessage = (ev) => {
-                const msg = typeof ev.data === "string" ? parseServerMessage(ev.data) : null;
-                if (!msg) {
-                    console.error("Failed to parse signaling message", ev.data);
-                    return;
-                }
+                const msg = parseMessage(ev.data, serverMessageSchema, "signaling");
+                if (!msg) return;
                 this.handlers.onServerMessage(msg);
             };
             webSocket.onclose = (ev) => this.handlers.onClose?.(ev);
@@ -96,66 +82,5 @@ export class SignalingClient {
 
     get state(): number {
         return this.webSocket?.readyState ?? WebSocket.CLOSED;
-    }
-}
-
-/** Every error code the server can send, used to validate incoming messages. */
-const ERROR_CODES: readonly ErrorCode[] = [
-    "unsupportedProtocol",
-    "badAuthCode",
-    "authRequired",
-    "unexpectedMessage",
-    "badSdpOffer",
-    "internal",
-];
-
-/**
- * Validate one incoming message.
- *
- * Anything that does not match the schema is rejected rather than passed on
- * half-formed, so a protocol mismatch surfaces here instead of as a confusing
- * failure later.
- */
-function parseServerMessage(raw: string): ServerMessage | null {
-    let parsed: unknown;
-
-    try {
-        parsed = JSON.parse(raw);
-    } catch {
-        return null;
-    }
-
-    if (typeof parsed !== "object" || parsed === null) return null;
-
-    const obj = parsed as Record<string, unknown>;
-
-    const str = (key: string): string | undefined =>
-        typeof obj[key] === "string" ? (obj[key] as string) : undefined;
-    const num = (key: string): number | undefined =>
-        typeof obj[key] === "number" ? (obj[key] as number) : undefined;
-
-    switch (str("type")) {
-        case "welcome": {
-            const protocol = num("protocol");
-            if (protocol === undefined) return null;
-            return { type: "welcome", protocol, ckey: str("ckey") ?? null };
-        }
-        case "answer": {
-            const sdp = str("sdp");
-            const session = num("session");
-            if (!sdp || session === undefined) return null;
-            return { type: "answer", sdp, session };
-        }
-        case "error": {
-            const code = str("code");
-            const message = str("message");
-            if (!code || message === undefined) return null;
-            if (!ERROR_CODES.includes(code as ErrorCode)) return null;
-            return { type: "error", code: code as ErrorCode, message };
-        }
-        case "bye":
-            return { type: "bye", reason: str("reason") ?? "" };
-        default:
-            return null;
     }
 }

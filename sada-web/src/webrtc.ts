@@ -1,4 +1,12 @@
 import config from "./config.json";
+import {
+    type ClientOrderedMessage,
+    parseMessage,
+    type ServerOrderedMessage,
+    type ServerUnorderedMessage,
+    serverOrderedMessageSchema,
+    serverUnorderedMessageSchema,
+} from "./schema";
 import type { SignalingClient } from "./signaling";
 
 /**
@@ -17,37 +25,6 @@ export type CallEvents = {
     onOrdered: (message: ServerOrderedMessage) => void;
     onUnordered: (message: ServerUnorderedMessage) => void;
 };
-
-export type ClientOrderedMessage =
-    | { type: "answer"; sdp: string }
-    | { type: "mute"; muted: boolean };
-
-export type ServerOrderedMessage = { type: "offer"; sdp: string };
-
-/**
- * A message from the unordered channel.
- *
- * Every one carries its own `seq` because the channel may deliver two out of order; the reader keeps the newest it
- * has seen per message type and throws away anything that has been overtaken. The counter wraps, so newer is
- * decided by distance rather than by magnitude; see `isNewer`.
- */
-export type ServerUnorderedMessage = {
-    type: "positions";
-    seq: number;
-    speakers: AudibleSpeaker[];
-};
-
-/** One speaker the listener holds an audio slot for. */
-export type AudibleSpeaker = {
-    session: number;
-    /** The m-line carrying them, matching some `RTCRtpTransceiver.mid`. */
-    mid: string;
-    /** Absent when they are not to be placed: on the radio, on another z-level, or somewhere the game has not described. */
-    offset: Offset | null;
-};
-
-/** How far a speaker is from the listener, in tiles. */
-export type Offset = { x: number; y: number };
 
 export class WebRTCManager {
     private peerConnection: RTCPeerConnection;
@@ -84,12 +61,8 @@ export class WebRTCManager {
         this.ordered = this.peerConnection.createDataChannel(ORDERED_CHANNEL_LABEL);
 
         this.ordered.onmessage = (event) => {
-            const msg =
-                typeof event.data === "string" ? parseServerOrderedMessage(event.data) : null;
-            if (!msg) {
-                console.error("Failed to parse ordered channel message", event.data);
-                return;
-            }
+            const msg = parseMessage(event.data, serverOrderedMessageSchema, "ordered channel");
+            if (!msg) return;
             this.events.onOrdered(msg);
         };
 
@@ -117,19 +90,18 @@ export class WebRTCManager {
         });
 
         this.unordered.onmessage = (event) => {
-            const msg =
-                typeof event.data === "string" ? parseServerUnorderedMessage(event.data) : null;
-            if (!msg) {
-                console.error("Failed to parse unordered channel message", event.data);
-                return;
-            }
+            const msg = parseMessage(event.data, serverUnorderedMessageSchema, "unordered channel");
+            if (!msg) return;
 
             const seen = this.lastSeq.get(msg.type);
+
             if (seen !== undefined && !isNewer(msg.seq, seen)) {
                 console.debug("dropping an overtaken message", msg.type, msg.seq, seen);
                 return;
             }
 
+            // Recorded before the dispatch, not after: there is no retry, so a handler that throws must not leave
+            // this message able to be applied again behind a newer one.
             this.lastSeq.set(msg.type, msg.seq);
             this.events.onUnordered(msg);
         };
@@ -288,87 +260,10 @@ export class WebRTCManager {
     }
 }
 
-function parseServerOrderedMessage(raw: string): ServerOrderedMessage | null {
-    let parsed: unknown;
-
-    try {
-        parsed = JSON.parse(raw);
-    } catch {
-        return null;
-    }
-
-    if (typeof parsed !== "object" || parsed === null) return null;
-
-    const obj = parsed as Record<string, unknown>;
-
-    const str = (key: string): string | undefined =>
-        typeof obj[key] === "string" ? (obj[key] as string) : undefined;
-
-    switch (str("type")) {
-        case "offer": {
-            const sdp = str("sdp");
-            return sdp ? { type: "offer", sdp } : null;
-        }
-        default:
-            return null;
-    }
-}
-
 /**
  * Whether `seq` comes after `seen` on a counter that wraps at 2^32.
  */
 function isNewer(seq: number, seen: number): boolean {
     const ahead = (seq - seen) >>> 0;
     return ahead !== 0 && ahead < 0x8000_0000;
-}
-
-function parseServerUnorderedMessage(raw: string): ServerUnorderedMessage | null {
-    let parsed: unknown;
-
-    try {
-        parsed = JSON.parse(raw);
-    } catch {
-        return null;
-    }
-
-    if (typeof parsed !== "object" || parsed === null) return null;
-
-    const obj = parsed as Record<string, unknown>;
-
-    switch (obj.type) {
-        case "positions": {
-            if (typeof obj.seq !== "number" || !Array.isArray(obj.speakers)) return null;
-
-            const speakers: AudibleSpeaker[] = [];
-            for (const entry of obj.speakers) {
-                const speaker = parseAudibleSpeaker(entry);
-                // One malformed entry makes the whole set untrustworthy: a missing speaker would be read as one
-                // who has stopped being audible.
-                if (!speaker) return null;
-                speakers.push(speaker);
-            }
-
-            return { type: "positions", seq: obj.seq, speakers };
-        }
-        default:
-            return null;
-    }
-}
-
-function parseAudibleSpeaker(raw: unknown): AudibleSpeaker | null {
-    if (typeof raw !== "object" || raw === null) return null;
-
-    const obj = raw as Record<string, unknown>;
-    if (typeof obj.session !== "number" || typeof obj.mid !== "string") return null;
-
-    if (obj.offset === null || obj.offset === undefined) {
-        return { session: obj.session, mid: obj.mid, offset: null };
-    }
-
-    if (typeof obj.offset !== "object") return null;
-
-    const offset = obj.offset as Record<string, unknown>;
-    if (typeof offset.x !== "number" || typeof offset.y !== "number") return null;
-
-    return { session: obj.session, mid: obj.mid, offset: { x: offset.x, y: offset.y } };
 }
