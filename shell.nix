@@ -16,7 +16,10 @@ pkgs.mkShell {
     pkgs.opus
     pkgs.cmake
     pkgs.openssl
+    pkgs.gcc_multi
+    pkgs.llvmPackages_21.libclang
   ];
 
   CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER = "${pkgs.pkgsi686Linux.stdenv.cc}/bin/cc";
+  LIBCLANG_PATH = "${pkgs.llvmPackages_21.libclang.lib}/lib";
 }
