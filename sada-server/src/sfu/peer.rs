@@ -206,14 +206,14 @@ impl Peer {
             ORDERED_CHANNEL_LABEL => &mut self.channels.ordered,
             UNORDERED_CHANNEL_LABEL => &mut self.channels.unordered,
             _ => {
-                debug!(?channel_id, ?label, "ignoring an unknown data channel");
+                debug!(?channel_id, ?label, ?self.player, "ignoring an unknown data channel");
                 return;
             },
         };
 
         *slot = Some(channel_id);
 
-        debug!(?channel_id, ?label, "data channel opened");
+        debug!(?channel_id, ?label, ?self.player, "data channel opened");
     }
 
     /// Forget a data channel, which leaves the peer connected but no longer reachable that way.
@@ -223,13 +223,13 @@ impl Peer {
         } else if self.channels.unordered == Some(channel_id) {
             &mut self.channels.unordered
         } else {
-            debug!(?channel_id, "ignoring the close of an unknown data channel");
+            debug!(?channel_id, ?self.player, "ignoring the close of an unknown data channel");
             return;
         };
 
         *slot = None;
 
-        debug!(?channel_id, "data channel closed");
+        debug!(?channel_id, ?self.player, "data channel closed");
     }
 
     /// The open ordered channel, if there is one.
@@ -266,7 +266,7 @@ impl Peer {
         let mut writer = Cursor::new(&mut self.send_on_buffer);
 
         if let Err(err) = serde_json::to_writer(&mut writer, message) {
-            error!(?err, "failed to encode a channel message");
+            error!(?err, ?self.player, "failed to encode a channel message");
             return false;
         }
 
@@ -274,7 +274,7 @@ impl Peer {
         let data = &self.send_on_buffer[..length];
 
         let Some(mut channel) = self.rtc.channel(channel_id) else {
-            debug!(?channel_id, "the data channel is gone");
+            debug!(?channel_id, ?self.player, "the data channel is gone");
             return false;
         };
 
@@ -285,12 +285,13 @@ impl Peer {
                 warn!(
                     ?channel_id,
                     len = data.len(),
+                    ?self.player,
                     "the data channel had no room for a message"
                 );
                 false
             },
             Err(err) => {
-                warn!(?channel_id, ?err, "the data channel write failed");
+                warn!(?channel_id, ?err, ?self.player, "the data channel write failed");
                 false
             },
         }
