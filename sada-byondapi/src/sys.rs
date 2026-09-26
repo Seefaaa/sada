@@ -117,7 +117,11 @@ impl From<String> for CByondValue {
 }
 
 impl From<CByondValue> for String {
-    fn from(value: CByondValue) -> Self { byond::to_string(value) }
+    fn from(value: CByondValue) -> Self { byond::to_string(&value) }
+}
+
+impl From<&CByondValue> for String {
+    fn from(value: &CByondValue) -> Self { byond::to_string(value) }
 }
 
 impl<T> From<Option<T>> for CByondValue

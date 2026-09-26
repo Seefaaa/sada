@@ -2036,8 +2036,14 @@ dependencies = [
  "sada-byondapi",
  "sada-common",
  "serde",
- "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "sada-client-async"
+version = "0.1.0"
+dependencies = [
+ "sada-byondapi",
 ]
 
 [[package]]

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "sada-byondapi",
     "sada-client",
+    "sada-client-async",
     "sada-common",
     "sada-server",
     "sada-utils",

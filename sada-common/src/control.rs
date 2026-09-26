@@ -112,7 +112,7 @@ impl TryFrom<sada_byondapi::sys::CByondValue> for PlayerPatch {
         let mut refused = None;
 
         for &[key, value] in list.as_chunks::<2>().0 {
-            if let Err(err) = patch.set(&String::from(key), value) {
+            if let Err(err) = patch.set(&String::from(&key), value) {
                 refused.get_or_insert(err);
             }
 
@@ -179,7 +179,7 @@ mod dm {
             return Err(format!("{field:?} wants a string"));
         }
 
-        Ok(String::from(value))
+        Ok(String::from(&value))
     }
 
     /// Read a player id, which DM carries as a decimal string because a number would lose its low bits.

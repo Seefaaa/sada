@@ -53,8 +53,8 @@ where
 }
 
 /// Render any value the way DM's `"[value]"` would, or an empty string if it cannot be rendered.
-pub fn to_string(value: CByondValue) -> String {
-    let mut buf = read_to_vec(|buf, len| unsafe { BYONDAPI.Byond_ToString(&value, buf as _, len) }, 24);
+pub fn to_string(value: &CByondValue) -> String {
+    let mut buf = read_to_vec(|buf, len| unsafe { BYONDAPI.Byond_ToString(value, buf as _, len) }, 24);
     buf.pop();
     buf.try_into().unwrap_or_default()
 }
@@ -111,5 +111,5 @@ pub mod sync {
     }
 
     /// [`super::to_string`], from off the game thread.
-    pub async fn to_string(value: CByondValue) -> String { with_main(move || super::to_string(value)).await }
+    pub async fn to_string(value: CByondValue) -> String { with_main(move || super::to_string(&value)).await }
 }

@@ -1,39 +1,25 @@
 #![feature(macro_attr)]
 #![allow(unused, missing_docs, clippy::missing_docs_in_private_items)]
 
-mod ffi;
-mod macros;
-mod runtime;
-mod shutdown;
+use sada_byondapi::{BYONDAPI, byond, sys::CByondValue};
 
-use std::{
-    mem::{MaybeUninit, zeroed},
-    sync::OnceLock,
-};
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn hello_world(argc: u32, argv: *mut CByondValue, waiting_proc: CByondValue) {
+    let [arg1] = sada_byondapi::macros::__parse_args(argc, argv);
 
-use tokio::sync::oneshot;
+    println!("arg1 rc:\t{:?}", byond::ref_count(&arg1));
 
-use crate::{
-    ffi::{BYOND, CByondValue},
-    runtime::runtime,
-    shutdown::Shutdown,
-};
+    byond::value_incref(&arg1);
 
-#[byond_fn]
-async fn example_async_function(num: i32) -> i32 {
-    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
 
-    runtime().spawn(async move {
-        let _ = tx.send(num);
+        byond::sync::with_main_forget(move || {
+            let retval = byond::new(c"/datum/hello", &[arg1]);
+            byond::value_decref(&arg1);
+
+            unsafe { BYONDAPI.Byond_Return(&waiting_proc, &retval) };
+            byond::value_decref(&retval);
+        })
     });
-
-    rx.await.unwrap()
-}
-
-#[byond_fn]
-fn shutdown() { runtime::shutdown(); }
-
-#[byond_fn]
-fn panicing() {
-    panic!("this is a test panic");
 }
