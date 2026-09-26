@@ -9,7 +9,7 @@
     "rust-analyzer.check.command": "clippy",
     "rust-analyzer.check.overrideCommand": null,
     // Enables optional features to make them available for code analysis and completion.
-    "rust-analyzer.cargo.features": ["sada-client/async", "sada-server/audio_dump"],
+    "rust-analyzer.cargo.features": ["sada-client/async"],
     // Appends the directory name to mod.rs files to disambiguate them in the editor.
     "workbench.editor.customLabels.patterns": {
         "**/mod.rs": "${dirname}/mod.rs"
