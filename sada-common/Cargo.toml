@@ -3,9 +3,6 @@ name = "sada-common"
 version.workspace = true
 edition.workspace = true
 
-[lints]
-workspace = true
-
 [dependencies]
 postcard.workspace = true
 sada-byondapi = { workspace = true, optional = true }
@@ -17,3 +14,6 @@ tokio = { workspace = true, optional = true, features = ["io-util", "sync"] }
 default = []
 async = ["dep:tokio"]
 byondapi = ["dep:sada-byondapi"]
+
+[lints]
+workspace = true
