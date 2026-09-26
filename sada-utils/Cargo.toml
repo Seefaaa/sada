@@ -1,0 +1,14 @@
+[package]
+name = "sada-utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["io-util", "sync"], optional = true }
+
+[features]
+default = []
+shutdown = ["dep:tokio"]
+
+[lints]
+workspace = true

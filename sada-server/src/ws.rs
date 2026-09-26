@@ -5,7 +5,7 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt as _, Stream, StreamExt as _, stream::SplitSink};
-use sada_common::{Ckey, SessionId};
+use sada_common::{Ckey, PlayerId, SessionId};
 use str0m::change::SdpOffer;
 use tokio::sync::mpsc;
 
@@ -23,13 +23,13 @@ const SIGNAL_BUFFER: usize = 16;
 pub async fn serve(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
 
-    let Some(ckey) = handshake(&mut sink, &mut stream, &state).await else {
+    let Some(bound) = handshake(&mut sink, &mut stream, &state).await else {
         return;
     };
 
     let welcome = ServerMessage::Welcome {
         protocol: PROTOCOL_VERSION,
-        ckey: ckey.clone(),
+        ckey: bound.as_ref().map(|bound| bound.1.clone()),
     };
     if send(&mut sink, &welcome).await.is_err() {
         return;
@@ -37,12 +37,14 @@ pub async fn serve(socket: WebSocket, state: AppState) {
 
     let (signal_tx, mut signal_rx) = mpsc::channel(SIGNAL_BUFFER);
 
-    let Some(session) = establish(&mut sink, &mut stream, &state, ckey.clone(), signal_tx).await else {
+    let player_id = bound.map(|bound| bound.0);
+
+    let Some(session) = establish(&mut sink, &mut stream, &state, player_id, signal_tx).await else {
         return;
     };
 
-    if let Some(ckey) = ckey {
-        state.directory.send(DirectoryCommand::Bind { ckey, session }).await;
+    if let Some(player) = player_id {
+        state.directory.send(DirectoryCommand::Bind { player, session }).await;
     }
 
     info!(%session, "session established");
@@ -76,7 +78,7 @@ async fn handshake(
     sink: &mut SplitSink<WebSocket, Message>,
     stream: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
     state: &AppState,
-) -> Option<Option<Ckey>> {
+) -> Option<Option<(PlayerId, Ckey)>> {
     let hello = read_message(stream).await?;
 
     let ClientMessage::Hello { protocol, auth_code } = hello else {
@@ -94,9 +96,9 @@ async fn handshake(
         return None;
     }
 
-    let ckey = match auth_code {
+    let bound = match auth_code {
         Some(code) => match state.directory.redeem(code).await {
-            Some(ckey) => Some(ckey),
+            Some((player, ckey)) => Some((player, ckey)),
             None => {
                 reject(sink, ErrorCode::BadAuthCode, "code is not valid").await;
                 return None;
@@ -109,7 +111,7 @@ async fn handshake(
         },
     };
 
-    Some(ckey)
+    Some(bound)
 }
 
 /// Read the client's offer and answer it, returning the new session.
@@ -117,7 +119,7 @@ async fn establish(
     sink: &mut SplitSink<WebSocket, Message>,
     stream: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
     state: &AppState,
-    ckey: Option<Ckey>,
+    player: Option<PlayerId>,
     signal: mpsc::Sender<ServerMessage>,
 ) -> Option<SessionId> {
     let message = read_message(stream).await?;
@@ -132,7 +134,7 @@ async fn establish(
         return None;
     };
 
-    let accepted = match state.worker.connect(offer, ckey, signal).await {
+    let accepted = match state.worker.connect(offer, player, signal).await {
         Ok(accepted) => accepted,
         Err(err) => {
             warn!(?err, "could not start a session");

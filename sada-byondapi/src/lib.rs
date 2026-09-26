@@ -1,13 +1,17 @@
-#![feature(macro_attr, negative_impls, custom_inner_attributes)]
+#![feature(macro_attr, custom_inner_attributes, const_trait_impl, const_convert, const_default)]
 
 //! Low and high level bindings to the BYONDAPI.
 
 mod bindings;
+pub mod byond;
 pub mod macros;
+#[cfg(feature = "async")]
+pub mod runtime;
 pub mod sys;
 
 use std::sync::LazyLock;
 
+#[doc(hidden)]
 pub use paste;
 
 use crate::sys::Byondapi;

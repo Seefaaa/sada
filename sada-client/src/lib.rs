@@ -1,22 +1,23 @@
-#![feature(macro_attr)]
+#![feature(macro_attr, const_trait_impl, const_convert)]
 
 //! A bridge library between game server and VC server.
 
 mod control;
-mod dm;
+mod player;
 
-use sada_byondapi::byond_fn;
+use std::num::NonZeroU16;
 
-use crate::{
-    control::{Poll, Ticket},
-    dm::encode_response,
-};
+use sada_byondapi::{byond, byond_fn, sys::CByondValue};
+use sada_common::{PlayerId, PlayerPatch, SessionId};
 
-/// Answer to a poll for a response that has not arrived yet.
-const PENDING: &str = "pending";
+use crate::control::Poll;
 
-/// Answer to a poll for a ticket that was never issued, has already been collected, or went stale.
-const UNKNOWN: &str = "unknown";
+/// A ticket on its way to DM, which sees it as a `/datum/sada_ticket`.
+struct Ticket(NonZeroU16);
+
+impl From<Ticket> for CByondValue {
+    fn from(value: Ticket) -> Self { byond::new(c"/datum/sada_ticket", &[CByondValue::from(value.0.get())]) }
+}
 
 /// Returns the version of this library.
 #[byond_fn]
@@ -27,7 +28,7 @@ fn get_version() -> String { env!("CARGO_PKG_VERSION").to_string() }
 /// Returns the ticket that version answer arrives under, or `0` if the worker could not be started. Nothing here
 /// touches the socket, so a server that is not up yet shows as an error on that ticket.
 #[byond_fn]
-fn init(path: String) -> Ticket { control::init(&path) }
+fn init(path: String) -> Result<Ticket, String> { control::init(&path).map(Ticket) }
 
 /// Stops the control worker and forgets every outstanding ticket.
 #[byond_fn]
@@ -38,96 +39,96 @@ fn stop() { control::stop() }
 /// Returns `pending` while the request is still with the worker, `unknown` for a ticket that was never issued or has
 /// already been collected, and the JSON-encoded response otherwise.
 #[byond_fn]
-fn poll_ticket(ticket: Ticket) -> String {
+fn poll_ticket(ticket: u16) -> CByondValue {
+    let Some(ticket) = NonZeroU16::new(ticket) else {
+        return CByondValue::NULL;
+    };
+
     match control::poll(ticket) {
-        Poll::Ready(response) => encode_response(response),
-        Poll::Pending => PENDING.to_owned(),
-        Poll::Unknown => UNKNOWN.to_owned(),
+        Poll::Ready(response) => response.into(),
+        Poll::Pending => const { 1u16.into() },
+        Poll::Unknown => CByondValue::NULL,
     }
 }
 
-/// Takes the oldest error no ticket was waiting for, or an empty string when there is none.
+/// Takes the oldest error no ticket was waiting for, or null when there is none.
 #[byond_fn]
-fn take_error() -> String { control::take_error().unwrap_or_default() }
+fn take_error() -> Option<String> { control::take_error() }
 
-/// Registers an authentication code. Returns the ticket its result arrives under.
+/// Returns the player id token for `ckey`, or null when another ckey already holds the id it derives.
 #[byond_fn]
-fn register_code(code: String, ckey: String) -> Ticket { control::register_code(&code, &ckey) }
+fn player_id(ckey: String) -> Option<String> { player::issue(&ckey).map(PlayerId::token) }
 
-/// Looks up the session bound to `ckey`. Returns the ticket its result arrives under.
+/// Registers an authentication code for `player`, greeting the browser that redeems it as `ckey`.
 #[byond_fn]
-fn check_auth(ckey: String) -> Ticket { control::check_auth(&ckey) }
+fn register_code(code: String, player: String, ckey: String) -> Result<Ticket, String> {
+    control::register_code(&code, &player, &ckey).map(Ticket)
+}
+
+/// Looks up the session bound to `player`.
+#[byond_fn]
+fn check_auth(player: String) -> Result<Ticket, String> { control::check_auth(&player).map(Ticket) }
 
 /// Starts transmitting. An empty `freq` means local speech.
 #[byond_fn]
-fn start_transmitting(session: String, freq: String) {
-    let Ok(session) = session.parse() else { return };
-    let channel = if freq.is_empty() { None } else { freq.parse().ok() };
+fn start_transmitting(session: String, freq: CByondValue) {
+    let Some(session) = SessionId::from_token(&session) else {
+        return;
+    };
+    let channel = (freq != CByondValue::NULL).then(|| freq.into());
     control::start_transmitting(session, channel);
 }
 
 /// Stops transmitting.
 #[byond_fn]
 fn stop_transmitting(session: String) {
-    let Ok(session) = session.parse() else { return };
+    let Some(session) = SessionId::from_token(&session) else {
+        return;
+    };
     control::stop_transmitting(session);
 }
 
 /// Adds one player's state delta to the batch that the next `flush` sends.
 ///
-/// `patch` is a JSON object of the fields that changed; absent fields mean unchanged. Returns an empty string when
+/// `patch` is an assoc list of the fields that changed; absent fields mean unchanged. Returns an empty string when
 /// the patch was accepted, or the reason it was not. Nothing reaches the socket until `flush`.
 #[byond_fn]
-fn patch_player(ckey: String, patch: String) -> String {
-    control::patch_player(&ckey, &patch).err().unwrap_or_default()
+fn patch_player(player: String, patch: CByondValue) -> String {
+    match PlayerPatch::try_from(patch) {
+        Ok(patch) => control::patch_player(&player, patch).err().unwrap_or_default(),
+        Err(refused) => refused,
+    }
 }
 
 /// Sends everything `patch_player` has piled up as one batch.
 #[byond_fn]
 fn flush() { control::flush() }
 
-/// Forgets a player entirely, dropping their authentication with it.
+/// Forgets a player entirely, dropping their authentication with it and freeing their id.
 #[byond_fn]
-fn remove_player(ckey: String) { control::remove_player(&ckey) }
+fn remove_player(player: String) { control::remove_player(&player) }
 
 /// Asks for up to `max` queued server events. Returns the ticket they arrive under.
 #[byond_fn]
-fn poll_events(max: u16) -> Ticket { control::poll_events(max) }
+fn poll_events(max: u16) -> Result<Ticket, String> { control::poll_events(max).map(Ticket) }
 
-#[cfg(test)]
-mod tests {
-    use sada_common::{ControlEvent, ControlResponse, SessionId};
+/// Sleeps a second off the game thread and answers afterwards, to exercise the async export shape.
+#[cfg(feature = "async")]
+#[byond_fn]
+async fn async_test() -> CByondValue {
+    use std::time::Duration;
 
-    use super::*;
+    use tokio::time::sleep;
 
-    #[test]
-    fn a_session_id_reaches_byond_as_a_string() {
-        // DM numbers are single-precision floats. As a number this id would arrive as 4294967296 and the slot would be
-        // gone, so every start_transmitting built from it would name the wrong session.
-        let session = SessionId::new(7, 1);
-        assert!(session.as_raw() > 1 << 24, "the trap only bites past 2^24");
+    println!("async test 1");
 
-        let response = encode_response(ControlResponse::Session { session: Some(session) });
-        assert_eq!(
-            response,
-            format!(r#"{{"session":{{"session":"{}"}}}}"#, session.as_raw())
-        );
+    sleep(Duration::from_secs(1)).await;
 
-        let events = encode_response(ControlResponse::Events(vec![ControlEvent::Authenticated {
-            ckey: "sefa".into(),
-            session,
-        }]));
-        assert!(
-            events.contains(&format!(r#""session":"{}""#, session.as_raw())),
-            "got {events}"
-        );
-    }
+    println!("async test 2");
 
-    #[test]
-    fn an_unauthenticated_player_has_no_session() {
-        assert_eq!(
-            encode_response(ControlResponse::Session { session: None }),
-            r#"{"session":{"session":null}}"#
-        );
-    }
+    let ret = byond::sync::with_main(|| CByondValue::from("async test done".to_string())).await;
+
+    println!("async test 3");
+
+    ret
 }

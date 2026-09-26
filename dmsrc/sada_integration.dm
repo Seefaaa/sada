@@ -15,8 +15,8 @@
 	var/sada_dirty = FALSE
 	/// Last values sent, so only what actually changed is sent again.
 	var/list/sada_cache
-	/// Ckey the last update was sent under, kept for Logout.
-	var/sada_ckey
+	/// Player id the last update was sent under, kept for Logout.
+	var/sada_id
 	/// Whether this player is holding the talk key down right now.
 	var/sada_talking = FALSE
 	/// Session the open microphone belongs to.
@@ -27,6 +27,19 @@
 	///
 	/// A string rather than a number because DM integers are 24 bit but session ids are 64 bit.
 	var/sada_session = null
+	/// Id the voice server knows this player by, "" if none could be issued, or null
+	/// until sada_get_player() has asked.
+	var/sada_id = null
+
+/// This player's id with the voice server, or "" when the bridge refused to issue one
+/// because another ckey already holds the id this one derives. Such a player is never
+/// described to the server, so it keeps them mute and deaf.
+/client/proc/sada_get_player_id()
+	if(isnull(sada_id))
+		sada_id = sada_player_id(ckey) || ""
+		if(!sada_id)
+			stack_trace("sada could not issue a player id for [ckey], voice chat stays off for them")
+	return sada_id
 
 /*
 	State reporting
@@ -50,15 +63,20 @@
 	if(!SSsada.can_fire || isnull(client))
 		return
 
+	var/sada_id = client.sada_get_player_id()
+
+	if(!sada_id)
+		return
+
 	// Remembered so Logout can silence this body: by then the client is already gone.
-	sada_ckey = client.ckey
+	src.sada_id = sada_id
 
 	var/list/patch = sada_make_patch(sada_cache)
 
 	if(!length(patch))
 		return
 
-	var/rejected = sada_patch_player(sada_ckey, patch)
+	var/rejected = sada_patch_player(sada_id, patch)
 	if(rejected)
 		// sada_make_patch has already recorded these values as sent, so the cache has to go;
 		// otherwise the fields it just wrote would never be offered again.
@@ -85,11 +103,13 @@
 	if(isnull(here))
 		return
 
-	if(cache["x"] != here.x || cache["y"] != here.y || cache["z"] != here.z)
-		cache["x"] = here.x
-		cache["y"] = here.y
-		cache["z"] = here.z
-		.["position"] = list("x" = here.x, "y" = here.y, "z" = here.z)
+	// One byte per coordinate, which is the whole of the 24 bits DM's bitwise operators and its
+	// numbers carry exactly. Every coordinate has to stay under 256 for that to hold.
+	var/position = (here.x << 16) | (here.y << 8) | here.z
+
+	if(cache["position"] != position)
+		cache["position"] = position
+		.["position"] = position
 
 /*
 	Things that change what the server needs to know
@@ -107,17 +127,17 @@
 /// Tells the server this body can no longer speak or hear.
 ///
 /// Logout cannot go through the client, which BYOND has already taken away, so this
-/// uses the ckey the last update was sent under.
+/// uses the player id the last update was sent under.
 /mob/living/proc/sada_silence()
-	if(!SSsada.can_fire || isnull(sada_ckey))
+	if(!SSsada.can_fire || !sada_id)
 		return
 
-	var/rejected = sada_patch_player(sada_ckey, list("mute" = TRUE, "deaf" = TRUE))
+	var/rejected = sada_patch_player(sada_id, list("mute" = TRUE, "deaf" = TRUE))
 	if(rejected)
-		stack_trace("sada could not silence [sada_ckey]: [rejected]")
+		stack_trace("sada could not silence player [sada_id]: [rejected]")
 
 	sada_cache = list()
-	sada_ckey = null
+	sada_id = null
 
 /mob/living/Move()
 	. = ..()
@@ -143,8 +163,8 @@
 	if(isliving(living))
 		living.sada_stop_talking()
 
-	if(SSsada.can_fire)
-		sada_remove_player(ckey)
+	if(SSsada.can_fire && sada_id)
+		sada_remove_player(sada_id)
 
 	return ..()
 

@@ -11,25 +11,27 @@
 
 /world/New()
 	. = ..()
+	world.log << "sada client version: [sada_get_version()]"
 
-	world.log << "Sada client version: [sada_get_version()]"
-
-	var/datum/sada_future/version = new(sada_init(SADA_TEST_SOCKET))
-	var/response = version.wait()
-	var/failure = sada_error_of(response)
-
-	if(failure)
-		world.log << "Sada init failed: [failure]"
-		shutdown()
+	var/datum/sada_response/version/response
+	try response = sada_init(SADA_TEST_SOCKET).wait()
+	catch(var/error1)
+		world.log << "sada init failed: [error1]"
+		Del()
 		return
 
-	var/list/server = islist(response) ? response["version"] : null
-	world.log << "Sada server version: [server?["version"]] (protocol [server?["protocol"]])"
+	if(istype(response, /datum/sada_response/error))
+		world.log << "sada init failed2: [astype(response, /datum/sada_response/error).message]"
+		Del()
+		return
 
+	world.log << "sada server version: [response.version] (protocol [response.protocol])"
+
+	sada_test_player_ids()
 	sada_test_patches()
 	sada_test_auth()
-	sada_test_events()
 	sada_test_session_token()
+	sada_test_events()
 
 	var/error = sada_take_error()
 	if(error)
@@ -38,14 +40,39 @@
 		world.log << "OK: no control errors."
 
 	sada_stop()
-	shutdown()
+	Del()
+
+// Two ckeys that derive the same player id.
+#define SADA_TEST_COLLIDING_FIRST "zxboiwrq"
+#define SADA_TEST_COLLIDING_SECOND "iqbltqzu"
+
+// The bridge issues ids, and the rest of the bindings only ever see those.
+/proc/sada_test_player_ids()
+	var/alpha = sada_player_id("alpha")
+
+	if(!istext(alpha))
+		world.log << "FAIL: alpha was not issued a player id token: [alpha]"
+	else if(sada_player_id("alpha") != alpha)
+		world.log << "FAIL: alpha was issued a different id the second time."
+	else if(sada_player_id("beta") == alpha)
+		world.log << "FAIL: alpha and beta were issued the same id."
+	else
+		world.log << "OK: player ids are stable string tokens ([alpha])."
+
+	var/first = sada_player_id(SADA_TEST_COLLIDING_FIRST)
+	var/second = sada_player_id(SADA_TEST_COLLIDING_SECOND)
+
+	if(isnull(first) || !isnull(second))
+		world.log << "FAIL: a ckey whose id belongs to another was not refused: [first], [second]"
+	else
+		world.log << "OK: a ckey whose id belongs to another is refused."
 
 // Describes one player to the server, failing loudly if the patch is refused.
 /proc/sada_test_patch(ckey, x, y, z)
-	var/rejected = sada_patch_player(ckey, list(
+	var/rejected = sada_patch_player(sada_player_id(ckey), list(
 		"mute" = FALSE,
 		"deaf" = FALSE,
-		"position" = list("x" = x, "y" = y, "z" = z),
+		"position" = (x << 16) | (y << 8) | z,
 	))
 
 	if(rejected)
@@ -65,30 +92,40 @@
 
 	// A patch the client cannot make sense of has to be refused here rather than
 	// disappearing into a batch.
-	if(!sada_patch_player("alpha", list("nonsense" = 1)))
-		world.log << "FAIL: an unknown patch field was accepted."
+	var/refused = sada_patch_player(sada_player_id("alpha"), list("nonsense" = 1))
+	if(refused)
+		world.log << "OK: an unknown patch field was refused ([refused])."
 	else
-		world.log << "OK: an unknown patch field is refused."
+		world.log << "FAIL: an unknown patch field was accepted."
 
 // Mints a code the way the game would, then asks whether anyone redeemed it.
 /proc/sada_test_auth()
 	var/code = "TEST42"
-	var/datum/sada_future/registered = new(sada_register_code(code, "alpha"))
-	var/response = registered.wait()
+	var/alpha = sada_player_id("alpha")
 
-	// A request that carries no result answers with the bare string "ok". Reading it
-	// as a list is a runtime error, which is what sada_error_of() exists to prevent.
-	if(islist(response))
-		world.log << "FAIL: an Ok response arrived as a list: [json_encode(response)]"
-	else if(sada_error_of(response))
-		world.log << "FAIL: registering a code failed: [sada_error_of(response)]"
+	// wait() throws both for a failure the server reported and for a ticket that went away, so a
+	// response that arrives at all is a real one and only needs its type checked.
+	var/datum/sada_response/ok/response
+	try response = sada_register_code(code, alpha, "alpha").wait()
+	catch(var/register_error)
+		world.log << "FAIL: registering a code failed: [register_error]"
+		return
+
+	if(!istype(response, /datum/sada_response/ok))
+		world.log << "FAIL: registering a code returned [response] instead of ok."
 	else
-		world.log << "OK: registered auth code [code] for alpha ([response]); enter it in the web client to bind a session."
+		world.log << "OK: registered auth code [code] for alpha; enter it in the web client to bind a session."
 
-	var/datum/sada_future/auth = new(sada_check_auth("alpha"))
-	var/bound = auth.wait()
-	var/list/session = islist(bound) ? bound["session"] : null
-	world.log << "Session for alpha: [session?["session"] || "none"]"
+	var/datum/sada_response/session/auth
+	try auth = sada_check_auth(alpha).wait()
+	catch(var/auth_error)
+		world.log << "FAIL: checking auth failed: [auth_error]"
+		return
+
+	if(!istype(auth, /datum/sada_response/session))
+		world.log << "FAIL: checking auth returned [auth] instead of a session."
+	else
+		world.log << "OK: checking auth returned a session token ([auth.session])."
 
 // Session ids are 64 bit and DM numbers are single-precision floats, so the client
 // hands them over as strings. Decoding one as a number loses the low bits, which is
@@ -104,13 +141,20 @@
 		world.log << "OK: session token survives as a string; as a number it would arrive as [as_number["session"]]."
 
 /proc/sada_test_events()
-	var/datum/sada_future/events = new(sada_poll_events(32))
-	var/response = events.wait()
-	var/list/queued = islist(response) ? response["events"] : null
+	var/datum/sada_response/events/response
+	try response = sada_poll_events(32).wait()
+	catch(var/error)
+		world.log << "FAIL: polling events failed: [error]"
+		return
+
+	var/list/datum/sada_event/queued = response.events
 
 	world.log << "Events queued: [length(queued)]"
-	for(var/list/event in queued)
-		world.log << "  [json_encode(event)]"
+
+	for(var/datum/sada_event/event in queued)
+		world.log << "  [event]"
 
 #undef SADA_TEST_SOCKET
 #undef SADA_TEST_RANGE
+#undef SADA_TEST_COLLIDING_FIRST
+#undef SADA_TEST_COLLIDING_SECOND

@@ -1,17 +1,10 @@
-#ifndef SADA
-#define SADA (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.so")
-#endif
-
-#define SADA_CALL_BYONDAPI(func, args...) call_ext(SADA, "byond:[#func]")(##args)
-
 // Nothing below waits on the voice server. Calls that carry a result hand back a
 // ticket and the answer is collected on a later tick, because call_ext runs on
 // BYOND's only thread and a stalled server would stall the world.
 
-// A response that has not arrived yet.
-#define SADA_PENDING "pending"
-// A ticket the client does not know about: never issued, already collected, or dropped as stale.
-#define SADA_UNKNOWN "unknown"
+var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.so")
+
+#define SADA_CALL(func, args...) (call_ext(SADA, "byond:[#func]")(##args))
 
 // How wait() gives the world a turn between polls. A codebase that has stoplag()
 // should define this as stoplag() before including this file.
@@ -19,117 +12,192 @@
 #define SADA_YIELD sleep(world.tick_lag)
 #endif
 
-/proc/sada_get_version()
-	return SADA_CALL_BYONDAPI(get_version)
+/proc/sada_get_version() as text
+	return SADA_CALL(get_version)
 
-// Starts the control worker. Returns the ticket the server version arrives under,
-// or 0 if the worker could not be started. Connecting happens on the worker, so a
-// server that is not up yet shows as an error on that ticket rather than here.
-/proc/sada_init(path)
-	return SADA_CALL_BYONDAPI(init, path)
+// Starts the control worker. Resolves to a /datum/sada_response/{version,error} or throws an error
+/proc/sada_init(path) as /datum/sada_ticket
+	var/datum/sada_result/result = SADA_CALL(init, path)
+	if(!result.ok) throw result.value
+	return result.value
 
-// Stops the control worker and forgets every outstanding ticket.
 /proc/sada_stop()
-	SADA_CALL_BYONDAPI(stop)
+	SADA_CALL(stop)
 
-// Returns SADA_PENDING, SADA_UNKNOWN, or the JSON-encoded response.
-/proc/sada_poll(ticket)
-	return SADA_CALL_BYONDAPI(poll_ticket, ticket)
+// Returns null if the ticket is unknown, 1 if it is pending, or a /datum/sada_response otherwise
+/proc/sada_poll(ticket) as /datum/sada_response
+	return SADA_CALL(poll_ticket, ticket)
 
-// The oldest error no ticket was waiting for, such as a failed fire-and-forget
-// request, or "" when there is none.
-/proc/sada_take_error()
-	return SADA_CALL_BYONDAPI(take_error)
+/proc/sada_take_error() as text|null
+	return SADA_CALL(take_error)
 
-/proc/sada_register_code(code, ckey)
-	return SADA_CALL_BYONDAPI(register_code, code, ckey)
+// Returns string or null
+/proc/sada_player_id(ckey) as text|null
+	return SADA_CALL(player_id, ckey)
 
-/proc/sada_check_auth(ckey)
-	return SADA_CALL_BYONDAPI(check_auth, ckey)
+// Ticket resolves ControlResponse::Ok or ControlResponse::Error
+/proc/sada_register_code(code, player_id, ckey) as /datum/sada_ticket
+	var/datum/sada_result/result = SADA_CALL(register_code, code, player_id, ckey)
+	if(!result.ok) throw result.value
+	return result.value
+
+// Ticket resolves ControlResponse::Session or ControlResponse::Error
+/proc/sada_check_auth(player_id) as /datum/sada_ticket
+	var/datum/sada_result/result = SADA_CALL(check_auth, player_id)
+	if(!result.ok) throw result.value
+	return result.value
 
 // Fire and forget: returns before the request reaches the socket. A hot microphone
 // cannot wait for a round trip.
 /proc/sada_start_transmitting(session, freq)
-	SADA_CALL_BYONDAPI(start_transmitting, "[session]", freq ? "[freq]" : "")
+	SADA_CALL(start_transmitting, session, freq)
 
 /proc/sada_stop_transmitting(session)
-	SADA_CALL_BYONDAPI(stop_transmitting, "[session]")
+	SADA_CALL(stop_transmitting, session)
 
 // Adds one player's state delta to the batch that the next sada_flush() sends.
 // Absent keys mean unchanged. Returns "" when the patch was accepted, or the reason
 // it was not; nothing reaches the socket until the flush.
-/proc/sada_patch_player(ckey, list/patch)
-	return SADA_CALL_BYONDAPI(patch_player, ckey, json_encode(patch))
+/proc/sada_patch_player(player_id, list/patch) as text
+	return SADA_CALL(patch_player, player_id, patch)
 
 // Sends everything sada_patch_player() has piled up as one frame.
 /proc/sada_flush()
-	SADA_CALL_BYONDAPI(flush)
+	SADA_CALL(flush)
 
 // Forgets a player entirely. This drops their authentication with it, so it belongs
 // to a client going away rather than to a player changing mobs.
-/proc/sada_remove_player(ckey)
-	SADA_CALL_BYONDAPI(remove_player, ckey)
+/proc/sada_remove_player(player_id)
+	SADA_CALL(remove_player, player_id)
 
-// Asks for up to max queued server events. Returns the ticket they arrive under.
-/proc/sada_poll_events(max)
-	return SADA_CALL_BYONDAPI(poll_events, max)
+// Asks for up to max queued server events.
+/proc/sada_poll_events(max) as /datum/sada_ticket
+	var/datum/sada_result/result = SADA_CALL(poll_events, max)
+	if(!result.ok) throw result.value
+	return result.value
 
-// The reason a response is a failure, or null when it is not one.
-//
-// Not every response is a list: a request that carries no result answers with the
-// bare string "ok", and every element of a batch answers the same way, so indexing a
-// response blind is a runtime error rather than a null. Read errors through here.
-/proc/sada_error_of(response)
-	if(isnull(response))
-		return "the request was dropped before the server answered it"
 
-	if(!islist(response))
-		return null
 
-	var/list/error = response["error"]
-	return error?["message"] || null
+/*
+	ControlResponse
+ */
 
-// A control request whose answer has not arrived yet.
-/datum/sada_future
-	// Ticket the client answers under; cleared once the answer is taken.
-	var/ticket = 0
+/// ControlResponse::Ok
+/datum/sada_response/ok
 
-/datum/sada_future/New(ticket)
-	. = ..()
+/// ControlResponse::Version
+/datum/sada_response/version
+	var/protocol // number
+	var/version // string
+
+/datum/sada_response/version/New(protocol, version)
+	src.protocol = protocol
+	src.version = version
+
+/// ControlResponse::Session
+/datum/sada_response/session
+	var/session // string or null
+
+/datum/sada_response/session/New(session)
+	src.session = session
+
+/// ControlResponse::Events
+/datum/sada_response/events
+	var/list/events // list of /datum/sada_event
+
+/datum/sada_response/events/New(...)
+	src.events = args.Copy()
+
+/// ControlResponse::Batch
+/datum/sada_response/batch
+	var/list/batch // list of /datum/sada_response
+
+/datum/sada_response/batch/New(...)
+	src.batch = args.Copy()
+
+/// ControlResponse::Error
+/datum/sada_response/error
+	var/message // string
+
+/datum/sada_response/error/New(message)
+	src.message = message
+
+
+/*
+	Event
+ */
+
+/// ControlEvent::Authenticated
+/datum/sada_event/authenticated
+	var/player_id // string
+	var/session // string
+
+/datum/sada_event/authenticated/New(player_id, session)
+	src.player_id = player_id
+	src.session = session
+
+/// ControlEvent::Disconnected
+/datum/sada_event/disconnected
+	var/player_id // string
+	var/session // string
+
+/datum/sada_event/disconnected/New(player_id, session)
+	src.player_id = player_id
+	src.session = session
+
+/// ControlEvent::Speaking
+/datum/sada_event/speaking
+	var/speaker // string
+	var/list/listeners // list of string
+
+/datum/sada_event/speaking/New(speaker, ...)
+	src.speaker = speaker
+	src.listeners = args.Copy(2)
+
+/// ControlEvent::Heard
+/datum/sada_event/heard
+	var/speaker // string
+	var/listener // string
+	var/channel // number or null
+	var/language // string or null
+
+/datum/sada_event/heard/New(speaker, listener, channel, language)
+	src.speaker = speaker
+	src.listener = listener
+	src.channel = channel
+	src.language = language
+
+
+/*
+	Ticket
+ */
+
+/datum/sada_ticket
+	var/ticket = 0 // number >0
+
+/datum/sada_ticket/New(ticket)
 	src.ticket = ticket
 
-// Returns /datum/poll/pending while the request is still with the worker, otherwise
-// /datum/poll/ready holding the decoded response, or null for a ticket the client
-// no longer knows about.
-/datum/sada_future/proc/poll()
-	if(!ticket)
-		return new /datum/poll/ready(null)
-
+/datum/sada_ticket/proc/wait() as /datum/sada_response
 	var/raw = sada_poll(ticket)
-	if(raw == SADA_PENDING)
-		return new /datum/poll/pending
-
-	ticket = 0
-	return new /datum/poll/ready(raw == SADA_UNKNOWN ? null : json_decode(raw))
-
-// Yields the calling proc, not the world, until the answer arrives.
-/datum/sada_future/proc/wait()
-	var/datum/poll/result = poll()
-
-	while(istype(result, /datum/poll/pending))
+	while(raw == 1) // pending
 		SADA_YIELD
-		result = poll()
+		raw = sada_poll(ticket)
+	var/datum/sada_response/error/error = astype(raw)
+	if(!isnull(error)) throw error.message
+	// An unknown ticket: stopped, restarted, or evicted while this was waiting on it. Throwing keeps
+	// every caller from reading a field off null.
+	if(isnull(raw)) throw "the request was dropped before the server answered it"
+	return raw
 
-	var/datum/poll/ready/ready = result
-	return ready.value
+/*
+	Result
+ */
 
-/datum/poll
+/datum/sada_result
+	var/ok // boolean
+	var/value // any
 
-/datum/poll/pending
-
-/datum/poll/ready
-	var/value
-
-/datum/poll/ready/New(value)
-	. = ..()
+/datum/sada_result/New(ok, value)
+	src.ok = ok
 	src.value = value

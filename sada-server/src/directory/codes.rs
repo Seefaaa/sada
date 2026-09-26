@@ -9,11 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sada_common::{AuthCode, Ckey};
+use sada_common::{AuthCode, Ckey, PlayerId};
 
 /// A code the game minted, waiting for a browser to present it.
 struct PendingCode {
     /// Player the code identifies.
+    player: PlayerId,
+    /// Name the browser that redeems the code is greeted with.
     ckey: Ckey,
     /// When it stops being accepted.
     expires: Instant,
@@ -41,14 +43,14 @@ impl CodeTable {
     /// The game mints a fresh code every time the player asks and shows it in a window that replaces the last one, so
     /// the older code is already gone from the only place the player could read it. Keeping it alive here would mean
     /// a code that opens a player's session and that nobody is looking at any more.
-    pub fn register(&mut self, code: AuthCode, ckey: Ckey) {
-        self.spend(&ckey);
-        self.register_at(code, ckey, Instant::now() + self.ttl);
+    pub fn register(&mut self, code: AuthCode, player: PlayerId, ckey: Ckey) {
+        self.spend(player);
+        self.register_at(code, player, ckey, Instant::now() + self.ttl);
     }
 
     /// Record a code that stops working at a given moment.
-    fn register_at(&mut self, code: AuthCode, ckey: Ckey, expires: Instant) {
-        self.codes.insert(code, PendingCode { ckey, expires });
+    fn register_at(&mut self, code: AuthCode, player: PlayerId, ckey: Ckey, expires: Instant) {
+        self.codes.insert(code, PendingCode { player, ckey, expires });
     }
 
     /// Spend a code, and say who it belonged to.
@@ -56,13 +58,13 @@ impl CodeTable {
     /// Redeeming consumes: whoever gets `Some` here is the one browser that code will ever authenticate, so two
     /// browsers racing on one code end with the second refused at its handshake, and a browser still holding a code
     /// the player has since replaced is refused too.
-    pub fn redeem(&mut self, code: &AuthCode) -> Option<Ckey> {
+    pub fn redeem(&mut self, code: &AuthCode) -> Option<(PlayerId, Ckey)> {
         let pending = self.codes.remove(code)?;
-        (pending.expires > Instant::now()).then_some(pending.ckey)
+        (pending.expires > Instant::now()).then_some((pending.player, pending.ckey))
     }
 
     /// Drop the code a player is holding, because they left or asked for another one.
-    pub fn spend(&mut self, ckey: &Ckey) { self.codes.retain(|_, pending| &pending.ckey != ckey); }
+    pub fn spend(&mut self, player: PlayerId) { self.codes.retain(|_, pending| pending.player != player); }
 
     /// Drop the codes nobody came back for, and say how many that was.
     pub fn sweep(&mut self) -> usize {
@@ -79,9 +81,12 @@ impl CodeTable {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use sada_common::{AuthCode, Ckey};
+    use sada_common::{AuthCode, Ckey, PlayerId};
 
     use super::CodeTable;
+
+    /// The player the fixture's code belongs to.
+    const ADMINBUS: PlayerId = PlayerId::from_raw(7);
 
     /// A table whose codes are still good, and one code already in it.
     fn table() -> (CodeTable, AuthCode, Ckey) {
@@ -89,7 +94,7 @@ mod tests {
         let code = AuthCode::from("ABC123");
         let ckey = Ckey::from("adminbus");
 
-        codes.register(code.clone(), ckey.clone());
+        codes.register(code.clone(), ADMINBUS, ckey.clone());
 
         (codes, code, ckey)
     }
@@ -97,7 +102,7 @@ mod tests {
     #[test]
     fn a_registered_code_resolves_to_its_player() {
         let (mut codes, code, ckey) = table();
-        assert_eq!(codes.redeem(&code), Some(ckey));
+        assert_eq!(codes.redeem(&code), Some((ADMINBUS, ckey)));
     }
 
     #[test]
@@ -111,7 +116,7 @@ mod tests {
         let (mut codes, code, ckey) = table();
 
         // Two browsers racing on one code: the second one is turned away.
-        assert_eq!(codes.redeem(&code), Some(ckey));
+        assert_eq!(codes.redeem(&code), Some((ADMINBUS, ckey)));
         assert_eq!(codes.redeem(&code), None);
     }
 
@@ -120,17 +125,17 @@ mod tests {
         let (mut codes, code, ckey) = table();
         let second = AuthCode::from("XYZ789");
 
-        codes.register(second.clone(), ckey.clone());
+        codes.register(second.clone(), ADMINBUS, ckey.clone());
 
         assert_eq!(codes.redeem(&code), None);
-        assert_eq!(codes.redeem(&second), Some(ckey));
+        assert_eq!(codes.redeem(&second), Some((ADMINBUS, ckey)));
     }
 
     #[test]
     fn leaving_spends_the_players_code() {
-        let (mut codes, code, ckey) = table();
+        let (mut codes, code, _) = table();
 
-        codes.spend(&ckey);
+        codes.spend(ADMINBUS);
 
         assert_eq!(codes.redeem(&code), None);
     }
@@ -139,15 +144,15 @@ mod tests {
     fn one_player_leaving_leaves_another_player_alone() {
         let (mut codes, code, ckey) = table();
 
-        codes.spend(&Ckey::from("somebodyelse"));
+        codes.spend(PlayerId::from_raw(8));
 
-        assert_eq!(codes.redeem(&code), Some(ckey));
+        assert_eq!(codes.redeem(&code), Some((ADMINBUS, ckey)));
     }
 
     #[test]
     fn an_expired_code_is_refused_and_forgotten() {
         let (mut codes, code, ckey) = table();
-        codes.register_at(code.clone(), ckey, Instant::now());
+        codes.register_at(code.clone(), ADMINBUS, ckey, Instant::now());
 
         assert_eq!(codes.redeem(&code), None);
         assert_eq!(
@@ -162,10 +167,15 @@ mod tests {
         let (mut codes, code, ckey) = table();
 
         let stale = AuthCode::from("OLD123");
-        codes.register_at(stale.clone(), Ckey::from("ghost"), Instant::now());
+        codes.register_at(
+            stale.clone(),
+            PlayerId::from_raw(9),
+            Ckey::from("ghost"),
+            Instant::now(),
+        );
 
         assert_eq!(codes.sweep(), 1);
         assert_eq!(codes.redeem(&stale), None);
-        assert_eq!(codes.redeem(&code), Some(ckey));
+        assert_eq!(codes.redeem(&code), Some((ADMINBUS, ckey)));
     }
 }

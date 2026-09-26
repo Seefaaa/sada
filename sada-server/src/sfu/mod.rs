@@ -11,7 +11,7 @@ pub mod slots;
 pub mod timeline;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io,
     mem,
     net::{IpAddr, SocketAddr},
@@ -20,7 +20,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sada_common::{Ckey, Position, SessionId, Transmit};
+use rustc_hash::FxHashMap;
+use sada_common::{PlayerId, Position, SessionId, Transmit};
+use sada_utils::shutdown::Shutdown;
 use str0m::{
     Candidate,
     Event,
@@ -59,7 +61,6 @@ use crate::{
         peer::{AnswerError, Audible, Peer, Relay},
         peers::Peers,
     },
-    shutdown::Shutdown,
 };
 
 /// Largest UDP datagram accepted.
@@ -90,7 +91,7 @@ pub enum WorkerCommand {
         /// The session's state machine. Boxed to keep the command enum small.
         rtc: Box<Rtc>,
         /// Player the session is bound to, if it authenticated.
-        ckey: Option<Ckey>,
+        player: Option<PlayerId>,
         /// Channel to push signaling messages back to the browser.
         signal: mpsc::Sender<ServerMessage>,
         /// Where to send the assigned session id.
@@ -142,7 +143,7 @@ pub enum SfuEvent {
         /// Session that ended.
         session: SessionId,
         /// Player it was bound to, if any.
-        ckey: Option<Ckey>,
+        player: Option<PlayerId>,
     },
 }
 
@@ -169,7 +170,7 @@ impl WorkerHandle {
     pub async fn connect(
         &self,
         offer: SdpOffer,
-        ckey: Option<Ckey>,
+        player: Option<PlayerId>,
         signal: mpsc::Sender<ServerMessage>,
     ) -> Result<ConnectAccepted, ConnectError> {
         let (rtc, answer) = accept_offer(self.local_addr, offer)?;
@@ -179,7 +180,7 @@ impl WorkerHandle {
         self.commands
             .send(WorkerCommand::Connect {
                 rtc: Box::new(rtc),
-                ckey,
+                player,
                 signal,
                 reply,
             })
@@ -211,7 +212,7 @@ pub struct Worker {
     /// Counter stamped on each round of position updates.
     position_seq: u32,
     /// Reverse index from player to session.
-    by_ckey: HashMap<Ckey, SessionId>,
+    by_player: FxHashMap<PlayerId, SessionId>,
     /// Incoming commands.
     commands: mpsc::Receiver<WorkerCommand>,
     /// Outgoing notifications.
@@ -281,7 +282,7 @@ impl Worker {
                         dirty: HashSet::new(),
                         routing: Arc::new(Routing::Unrestricted),
                         position_seq: 0,
-                        by_ckey: HashMap::new(),
+                        by_player: FxHashMap::default(),
                         commands,
                         events,
                         shutdown,
@@ -347,11 +348,11 @@ impl Worker {
         match command {
             WorkerCommand::Connect {
                 rtc,
-                ckey,
+                player,
                 signal,
                 reply,
             } => {
-                let _ = reply.send(self.register(*rtc, ckey, signal));
+                let _ = reply.send(self.register(*rtc, player, signal));
             },
             WorkerCommand::SetTransmit { session, transmit } => {
                 if let Some(peer) = self.peers.get_mut(session) {
@@ -369,12 +370,12 @@ impl Worker {
     /// Register an already-built session and assign it an id.
     ///
     /// Everything expensive has happened by the time this runs; see [`WorkerHandle::connect`].
-    fn register(&mut self, rtc: Rtc, ckey: Option<Ckey>, signal: mpsc::Sender<ServerMessage>) -> SessionId {
-        let peer = Peer::new(rtc, ckey.clone(), signal, Instant::now());
+    fn register(&mut self, rtc: Rtc, player: Option<PlayerId>, signal: mpsc::Sender<ServerMessage>) -> SessionId {
+        let peer = Peer::new(rtc, player, signal, Instant::now());
         let session = self.peers.insert(peer);
 
-        if let Some(ckey) = ckey {
-            self.by_ckey.insert(ckey, session);
+        if let Some(player) = player {
+            self.by_player.insert(player, session);
         }
 
         #[cfg(feature = "audio_dump")]
@@ -658,15 +659,15 @@ impl Worker {
         };
 
         let here = table
-            .zip(listener.ckey.as_ref())
-            .and_then(|(table, ckey)| table.position(ckey));
+            .zip(listener.player)
+            .and_then(|(table, player)| table.position(player));
 
         let mut speakers = listener
             .audible()
             .map(|(session, mid)| {
                 let there = table
-                    .zip(self.peers.get(session).and_then(|speaker| speaker.ckey.as_ref()))
-                    .and_then(|(table, ckey)| table.position(ckey));
+                    .zip(self.peers.get(session).and_then(|speaker| speaker.player))
+                    .and_then(|(table, player)| table.position(player));
 
                 let on_radio = matches!(
                     self.peers.get(session).and_then(|speaker| speaker.transmit),
@@ -714,25 +715,27 @@ impl Worker {
                     return Vec::new();
                 }
 
-                let (Some(ckey), Some(transmit)) = (peer.ckey.as_ref(), peer.transmit) else {
+                let (Some(player), Some(transmit)) = (peer.player, peer.transmit) else {
                     return Vec::new();
                 };
 
-                if !table.can_speak(ckey) {
+                if !table.can_speak(player) {
                     return Vec::new();
                 }
 
                 let listeners = match transmit {
-                    Transmit::Local => table.local_listeners(ckey),
+                    Transmit::Local => table.local_listeners(player),
                     // Naming a frequency is not the same as being allowed to use
                     // it; the game decides which radios are actually keyed up.
-                    Transmit::Radio(channel) if table.can_transmit_on(ckey, channel) => table.radio_listeners(channel),
+                    Transmit::Radio(channel) if table.can_transmit_on(player, channel) => {
+                        table.radio_listeners(channel)
+                    },
                     Transmit::Radio(_) => return Vec::new(),
                 };
 
                 listeners
                     .iter()
-                    .filter_map(|listener| self.by_ckey.get(listener).copied())
+                    .filter_map(|listener| self.by_player.get(listener).copied())
                     .filter(|&session| session != speaker)
                     .collect()
             },
@@ -778,10 +781,10 @@ impl Worker {
 
         // Only forget the player if the index still points at this session: they may already be on a newer one, and
         // dropping that entry would leave a live session nobody can route audio to.
-        if let Some(ckey) = &peer.ckey
-            && self.by_ckey.get(ckey) == Some(&session)
+        if let Some(player) = peer.player
+            && self.by_player.get(&player) == Some(&session)
         {
-            self.by_ckey.remove(ckey);
+            self.by_player.remove(&player);
         }
 
         // Everyone listening to this speaker can reuse the slot it held.
@@ -793,7 +796,7 @@ impl Worker {
 
         let _ = self.events.try_send(SfuEvent::Closed {
             session,
-            ckey: peer.ckey,
+            player: peer.player,
         });
     }
 

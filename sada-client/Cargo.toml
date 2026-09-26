@@ -11,7 +11,13 @@ name = "sada"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-sada-byondapi.workspace = true
-sada-common.workspace = true
+flume.workspace = true
+sada-byondapi = { workspace = true, features = ["sada"] }
+sada-common = { workspace = true, features = ["byondapi"] }
 serde.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["full"], optional = true }
+
+[features]
+default = []
+async = ["sada-byondapi/async", "dep:tokio"]

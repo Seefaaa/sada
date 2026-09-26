@@ -2,9 +2,10 @@
 //!
 //! The game sends deltas ([`PlayerPatch`]), so the authoritative picture lives here and each patch is merged into it.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::hash_map::Entry;
 
-use sada_common::{Ckey, Freq, PlayerPatch, Position};
+use rustc_hash::FxHashMap;
+use sada_common::{Freq, PlayerId, PlayerPatch, Position};
 
 /// Everything the game has told us about one player.
 #[derive(Clone, Debug, PartialEq)]
@@ -20,7 +21,7 @@ pub struct PlayerState {
     /// Where the player is standing, when the game reports positions.
     pub position: Option<Position>,
     /// Players who can hear this one speak locally, when the game computes it.
-    pub local_with: Vec<Ckey>,
+    pub local_with: Vec<PlayerId>,
     /// Frequencies this player may transmit on.
     pub hot_freqs: Vec<Freq>,
     /// Frequencies this player receives.
@@ -113,8 +114,8 @@ impl PlayerState {
 /// Every player the game has described.
 #[derive(Debug, Default)]
 pub struct PlayerTable {
-    /// State by player key.
-    players: HashMap<Ckey, PlayerState>,
+    /// State by player.
+    players: FxHashMap<PlayerId, PlayerState>,
 }
 
 impl PlayerTable {
@@ -126,8 +127,8 @@ impl PlayerTable {
     ///
     /// Returns whether anything actually changed, so the caller can skip recomputing the routing table for a no-op
     /// patch.
-    pub fn apply(&mut self, ckey: Ckey, patch: PlayerPatch) -> bool {
-        match self.players.entry(ckey) {
+    pub fn apply(&mut self, player: PlayerId, patch: PlayerPatch) -> bool {
+        match self.players.entry(player) {
             Entry::Occupied(mut entry) => {
                 let before = entry.get().clone();
                 entry.get_mut().apply(patch);
@@ -143,14 +144,16 @@ impl PlayerTable {
     }
 
     /// Forget a player entirely. Returns whether they were known.
-    pub fn remove(&mut self, ckey: &Ckey) -> bool { self.players.remove(ckey).is_some() }
+    pub fn remove(&mut self, player: PlayerId) -> bool { self.players.remove(&player).is_some() }
 
     /// Look up a player's state.
     #[must_use]
-    pub fn get(&self, ckey: &Ckey) -> Option<&PlayerState> { self.players.get(ckey) }
+    pub fn get(&self, player: PlayerId) -> Option<&PlayerState> { self.players.get(&player) }
 
     /// Iterate over every known player.
-    pub fn iter(&self) -> impl Iterator<Item = (&Ckey, &PlayerState)> { self.players.iter() }
+    pub fn iter(&self) -> impl Iterator<Item = (PlayerId, &PlayerState)> {
+        self.players.iter().map(|(player, state)| (*player, state))
+    }
 
     /// Number of known players.
     #[must_use]
@@ -163,9 +166,12 @@ impl PlayerTable {
 
 #[cfg(test)]
 mod tests {
-    use sada_common::{Freq, PlayerPatch, Position};
+    use sada_common::{Freq, PlayerId, PlayerPatch, Position};
 
     use super::{PlayerState, PlayerTable};
+
+    /// The player the table tests describe.
+    const SEFA: PlayerId = PlayerId::from_raw(1);
 
     #[test]
     fn an_undescribed_player_is_silent_and_deaf() {
@@ -214,7 +220,7 @@ mod tests {
     fn an_unknown_player_is_created_by_their_first_patch() {
         let mut table = PlayerTable::new();
         assert!(table.apply(
-            "sefa".into(),
+            SEFA,
             PlayerPatch {
                 mute: Some(false),
                 ..Default::default()
@@ -222,15 +228,15 @@ mod tests {
         ));
 
         assert_eq!(table.len(), 1);
-        assert!(table.get(&"sefa".into()).unwrap().can_speak());
-        assert!(!table.get(&"sefa".into()).unwrap().can_hear());
+        assert!(table.get(SEFA).unwrap().can_speak());
+        assert!(!table.get(SEFA).unwrap().can_hear());
     }
 
     #[test]
     fn a_patch_that_changes_nothing_reports_no_change() {
         let mut table = PlayerTable::new();
         table.apply(
-            "sefa".into(),
+            SEFA,
             PlayerPatch {
                 deaf: Some(false),
                 ..Default::default()
@@ -238,22 +244,22 @@ mod tests {
         );
 
         assert!(!table.apply(
-            "sefa".into(),
+            SEFA,
             PlayerPatch {
                 deaf: Some(false),
                 ..Default::default()
             }
         ));
-        assert!(!table.apply("sefa".into(), PlayerPatch::default()));
+        assert!(!table.apply(SEFA, PlayerPatch::default()));
     }
 
     #[test]
     fn removing_a_player_forgets_them() {
         let mut table = PlayerTable::new();
-        table.apply("sefa".into(), PlayerPatch::default());
+        table.apply(SEFA, PlayerPatch::default());
 
-        assert!(table.remove(&"sefa".into()));
-        assert!(!table.remove(&"sefa".into()));
+        assert!(table.remove(SEFA));
+        assert!(!table.remove(SEFA));
         assert!(table.is_empty());
     }
 }

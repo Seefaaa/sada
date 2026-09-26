@@ -8,14 +8,11 @@ pub mod codes;
 pub mod player;
 pub mod routing;
 
-use std::{
-    collections::{HashMap, VecDeque},
-    mem,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::VecDeque, mem, sync::Arc, time::Duration};
 
-use sada_common::{AuthCode, Ckey, ControlEvent, PlayerPatch, SessionId, Transmit};
+use rustc_hash::FxHashMap;
+use sada_common::{AuthCode, Ckey, ControlEvent, PlayerId, PlayerPatch, SessionId, Transmit};
+use sada_utils::shutdown::Shutdown;
 use tokio::{
     sync::{mpsc, oneshot},
     time::{MissedTickBehavior, interval},
@@ -29,7 +26,6 @@ use crate::{
         routing::{BroadcastRouter, HearerListRouter, ProximityRouter, Router},
     },
     sfu::{SfuEvent, WorkerCommand, WorkerHandle},
-    shutdown::Shutdown,
 };
 
 /// Largest number of queued events held for the game.
@@ -51,26 +47,28 @@ pub enum DirectoryCommand {
         /// Code shown to the player.
         code: AuthCode,
         /// Player it belongs to.
+        player: PlayerId,
+        /// Name the browser is greeted with.
         ckey: Ckey,
     },
     /// A browser presented a code. Answers with the player it identifies, spending the code.
     Redeem {
         /// Code the browser sent.
         code: AuthCode,
-        /// Where to send the resolved player.
-        reply: oneshot::Sender<Option<Ckey>>,
+        /// Where to send the resolved player, and the name to greet them with.
+        reply: oneshot::Sender<Option<(PlayerId, Ckey)>>,
     },
     /// A browser session finished connecting and is bound to the player whose code it redeemed.
     Bind {
         /// Player that authenticated.
-        ckey: Ckey,
+        player: PlayerId,
         /// Session now bound to them.
         session: SessionId,
     },
     /// The game asks which session a player has authenticated.
     CheckAuth {
         /// Player to look up.
-        ckey: Ckey,
+        player: PlayerId,
         /// Where to send the answer.
         reply: oneshot::Sender<Option<SessionId>>,
     },
@@ -84,14 +82,14 @@ pub enum DirectoryCommand {
     /// The game updated a player's state.
     PatchPlayer {
         /// Player to update.
-        ckey: Ckey,
+        player: PlayerId,
         /// Fields that changed.
         patch: PlayerPatch,
     },
     /// The game dropped a player.
     RemovePlayer {
         /// Player to forget.
-        ckey: Ckey,
+        player: PlayerId,
     },
     /// The game is collecting queued events.
     PollEvents {
@@ -114,7 +112,7 @@ impl DirectoryHandle {
     pub async fn send(&self, command: DirectoryCommand) { let _ = self.commands.send(command).await; }
 
     /// Spend an auth code, answering with the player it identifies.
-    pub async fn redeem(&self, code: AuthCode) -> Option<Ckey> {
+    pub async fn redeem(&self, code: AuthCode) -> Option<(PlayerId, Ckey)> {
         let (reply, answer) = oneshot::channel();
         let command = DirectoryCommand::Redeem { code, reply };
         self.commands.send(command).await.ok()?;
@@ -122,9 +120,9 @@ impl DirectoryHandle {
     }
 
     /// Look up the session bound to a player.
-    pub async fn check_auth(&self, ckey: Ckey) -> Option<SessionId> {
+    pub async fn check_auth(&self, player: PlayerId) -> Option<SessionId> {
         let (reply, answer) = oneshot::channel();
-        let command = DirectoryCommand::CheckAuth { ckey, reply };
+        let command = DirectoryCommand::CheckAuth { player, reply };
         self.commands.send(command).await.ok()?;
         answer.await.ok().flatten()
     }
@@ -149,7 +147,7 @@ pub struct Directory {
     /// Codes the game has minted that nobody has connected with yet.
     codes: CodeTable,
     /// Which session each player is bound to.
-    bindings: HashMap<Ckey, SessionId>,
+    bindings: FxHashMap<PlayerId, SessionId>,
     /// Events waiting for the game to collect them.
     events: VecDeque<ControlEvent>,
     /// Whether player state has moved since the last snapshot went to the SFU.
@@ -187,7 +185,7 @@ impl Directory {
             players: PlayerTable::new(),
             router,
             codes: CodeTable::new(code_ttl),
-            bindings: HashMap::new(),
+            bindings: FxHashMap::default(),
             events: VecDeque::new(),
             routing_dirty: false,
             worker,
@@ -253,25 +251,25 @@ impl Directory {
     /// Handle one command.
     async fn on_command(&mut self, command: DirectoryCommand) {
         match command {
-            DirectoryCommand::RegisterCode { code, ckey } => {
-                debug!(?code, ckey = %ckey, "code registered");
-                self.codes.register(code, ckey);
+            DirectoryCommand::RegisterCode { code, player, ckey } => {
+                debug!(?code, %player, %ckey, "code registered");
+                self.codes.register(code, player, ckey);
             },
 
             DirectoryCommand::Redeem { code, reply } => {
-                let ckey = self.codes.redeem(&code);
-                debug!(?code, accepted = ckey.is_some(), "code redeemed");
-                let _ = reply.send(ckey);
+                let player = self.codes.redeem(&code);
+                debug!(?code, accepted = player.is_some(), "code redeemed");
+                let _ = reply.send(player);
             },
 
-            DirectoryCommand::Bind { ckey, session } => {
-                debug!(ckey = %ckey, session = %session, "player bound to session");
-                self.bindings.insert(ckey.clone(), session);
-                self.queue(ControlEvent::Authenticated { ckey, session });
+            DirectoryCommand::Bind { player, session } => {
+                debug!(%player, %session, "player bound to session");
+                self.bindings.insert(player, session);
+                self.queue(ControlEvent::Authenticated { player, session });
             },
 
-            DirectoryCommand::CheckAuth { ckey, reply } => {
-                let _ = reply.send(self.bindings.get(&ckey).copied());
+            DirectoryCommand::CheckAuth { player, reply } => {
+                let _ = reply.send(self.bindings.get(&player).copied());
             },
 
             DirectoryCommand::SetTransmit { session, transmit } => {
@@ -279,15 +277,15 @@ impl Directory {
                 self.worker.send(WorkerCommand::SetTransmit { session, transmit }).await;
             },
 
-            DirectoryCommand::PatchPlayer { ckey, patch } => {
-                self.routing_dirty |= self.players.apply(ckey, patch);
+            DirectoryCommand::PatchPlayer { player, patch } => {
+                self.routing_dirty |= self.players.apply(player, patch);
             },
 
-            DirectoryCommand::RemovePlayer { ckey } => {
-                debug!(ckey = %ckey, "player removed");
-                self.codes.spend(&ckey);
-                self.bindings.remove(&ckey);
-                self.routing_dirty |= self.players.remove(&ckey);
+            DirectoryCommand::RemovePlayer { player } => {
+                debug!(%player, "player removed");
+                self.codes.spend(player);
+                self.bindings.remove(&player);
+                self.routing_dirty |= self.players.remove(player);
             },
 
             DirectoryCommand::PollEvents { max, reply } => {
@@ -300,18 +298,18 @@ impl Directory {
     /// Handle one notification from the SFU.
     fn on_sfu_event(&mut self, event: SfuEvent) {
         match event {
-            SfuEvent::Closed { session, ckey } => {
-                let Some(ckey) = ckey else {
+            SfuEvent::Closed { session, player } => {
+                let Some(player) = player else {
                     return;
                 };
 
                 // Only clear the binding if it still points at this session; the
                 // player may already have reconnected on a new one.
-                if self.bindings.get(&ckey) == Some(&session) {
-                    self.bindings.remove(&ckey);
+                if self.bindings.get(&player) == Some(&session) {
+                    self.bindings.remove(&player);
                 }
 
-                self.queue(ControlEvent::Disconnected { ckey, session });
+                self.queue(ControlEvent::Disconnected { player, session });
             },
         }
     }

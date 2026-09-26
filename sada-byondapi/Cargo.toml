@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 libloading.workspace = true
 paste.workspace = true
+sada-utils = { workspace = true, features = ["shutdown"], optional = true }
+tokio = { workspace = true, features = ["rt", "sync"], optional = true }
 
 [build-dependencies]
 bindgen = { workspace = true, optional = true }
@@ -13,7 +15,9 @@ doxygen-rs.workspace = true
 
 [features]
 default = []
-generate-bindings = ["bindgen"]
+async = ["dep:tokio", "dep:sada-utils"]
+generate-bindings = ["dep:bindgen"]
+sada = []
 
 [lints]
 workspace = true

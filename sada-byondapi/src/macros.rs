@@ -2,6 +2,8 @@
 
 use std::{backtrace::Backtrace, borrow::Cow, cell::RefCell, sync::Once};
 
+#[cfg(feature = "async")]
+use crate::BYONDAPI;
 use crate::sys::CByondValue;
 
 /// Define a function BYOND can call as `call_ext(lib, "byond:name")`.
@@ -36,7 +38,7 @@ macro_rules! byond_fn {
         $crate::paste::paste! {
             #[unsafe(no_mangle)]
             #[allow(missing_docs, clippy::missing_safety_doc)]
-            pub extern "C" fn $name(
+            pub extern "C-unwind" fn $name(
                 __argc: u32, __argv: *mut $crate::sys::CByondValue,
             ) -> $crate::sys::CByondValue {
                 $crate::byond_fn!(@catch {
@@ -48,6 +50,32 @@ macro_rules! byond_fn {
             $(#[$met])*
             #[inline(always)]
             fn [<__ $name>]($($arg : $arg_ty),*) $(-> $ret)? $body
+        }
+    };
+
+    (
+        $(#[$met:meta])*
+        async fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) $(-> $ret:ty)? $body:block
+    ) => {
+        $crate::paste::paste! {
+            #[unsafe(no_mangle)]
+            #[allow(missing_docs, clippy::missing_safety_doc)]
+            pub extern "C-unwind" fn $name(
+                __argc: u32, __argv: *mut $crate::sys::CByondValue, __waiting_proc: $crate::sys::CByondValue,
+            ) {
+                $crate::byond_fn!(@catch {
+                    $crate::byond_fn!(@args __argc, __argv, $($arg : $arg_ty),*);
+                    $($crate::macros::__must_send::<$arg_ty>();)*
+                    $crate::runtime::runtime().spawn(async move {
+                        let __res = [<__ $name>]($($arg),*).await;
+                        $crate::macros::__must_send::<($($ret)?)>();
+                        let __data: *mut (($($ret)?), _) = Box::into_raw(Box::new((__res, __waiting_proc)));
+                        unsafe { $crate::BYONDAPI.Byond_ThreadSync(Some($crate::macros::__return::<($($ret)?)>), __data as _, false) };
+                    });
+                })
+            }
+            $(#[$met])*
+            async fn [<__ $name>]($($arg : $arg_ty),*) $(-> $ret)? $body
         }
     };
 
@@ -125,3 +153,21 @@ pub fn __panic_msg() -> String {
     }
     String::new()
 }
+
+#[doc(hidden)]
+#[cfg(feature = "async")]
+/// Callback for [`Byond_ThreadSync`](crate::sys::Byondapi::Byond_ThreadSync) in [`byond_fn`] macro to return async
+/// results to BYOND's thread.
+pub extern "C-unwind" fn __return<R>(data: *mut std::ffi::c_void) -> CByondValue
+where
+    CByondValue: From<R>,
+{
+    let (ret, waiting_proc) = *unsafe { Box::from_raw(data as *mut (R, CByondValue)) };
+    unsafe { BYONDAPI.Byond_Return(&waiting_proc, &CByondValue::from(ret)) };
+    CByondValue::NULL
+}
+
+#[doc(hidden)]
+#[cfg(feature = "async")]
+/// Assert that the type is [`Send`], so the async we can move it from/to BYOND's thread.
+pub fn __must_send<T: Send>() {}

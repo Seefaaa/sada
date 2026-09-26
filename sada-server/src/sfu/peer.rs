@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sada_common::{Ckey, SessionId, Transmit};
+use sada_common::{PlayerId, SessionId, Transmit};
 use serde::Serialize;
 use str0m::{
     Rtc,
@@ -137,7 +137,7 @@ pub struct Peer {
     /// WebRTC state machine. Owned exclusively by the worker task.
     pub rtc: Rtc,
     /// Player this session is bound to, absent while anonymous.
-    pub ckey: Option<Ckey>,
+    pub player: Option<PlayerId>,
     /// What the player is transmitting on, `None` when not transmitting.
     ///
     /// Applied the moment the game says so rather than at snapshot cadence: a
@@ -173,10 +173,10 @@ pub struct Peer {
 
 impl Peer {
     /// Wrap a freshly built [`Rtc`].
-    pub fn new(rtc: Rtc, ckey: Option<Ckey>, signal: mpsc::Sender<ServerMessage>, now: Instant) -> Self {
+    pub fn new(rtc: Rtc, player: Option<PlayerId>, signal: mpsc::Sender<ServerMessage>, now: Instant) -> Self {
         Self {
             rtc,
-            ckey,
+            player,
             transmit: None,
             self_muted: false,
             created: now,

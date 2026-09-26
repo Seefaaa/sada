@@ -273,12 +273,16 @@ mod tests {
     use std::io::Cursor;
 
     use super::{ControlFrameBuffer, Error, MAX_CONTROL_FRAME_LEN};
-    use crate::control::{ControlRequest, ControlResponse};
+    use crate::{
+        control::{ControlRequest, ControlResponse},
+        ids::PlayerId,
+    };
 
     /// A request small enough to be uninteresting, used where the value does not matter.
     fn request() -> ControlRequest {
         ControlRequest::RegisterCode {
             code: "AB12CD".into(),
+            player: PlayerId::from_raw(1),
             ckey: "sefa".into(),
         }
     }
@@ -391,7 +395,10 @@ mod tests {
 #[cfg(all(test, feature = "async"))]
 mod async_tests {
     use super::{ControlFrameBuffer, Error, MAX_CONTROL_FRAME_LEN};
-    use crate::control::{ControlRequest, ControlResponse};
+    use crate::{
+        control::{ControlRequest, ControlResponse},
+        ids::PlayerId,
+    };
 
     /// A response that encodes to `payload` bytes of message, give or take framing overhead.
     fn response_of(payload: usize) -> ControlResponse {
@@ -402,7 +409,9 @@ mod async_tests {
 
     #[tokio::test]
     async fn a_frame_round_trips_through_a_stream() {
-        let value = ControlRequest::RemovePlayer { ckey: "sefa".into() };
+        let value = ControlRequest::RemovePlayer {
+            player: PlayerId::from_raw(1),
+        };
 
         let mut wire = Vec::new();
         ControlFrameBuffer::new().write_async(&mut wire, &value).await.unwrap();

@@ -39,6 +39,7 @@
 
 /datum/config_entry/string/sada_control_socket
 	protection = CONFIG_ENTRY_LOCKED | CONFIG_ENTRY_HIDDEN
+	default = "/tmp/sada.sock"
 
 SUBSYSTEM_DEF(sada)
 	name = "Sada"
@@ -53,7 +54,7 @@ SUBSYSTEM_DEF(sada)
 	var/server_version
 
 	/// Ticket of the event poll in flight, or 0 when there is none.
-	var/events_ticket = 0
+	var/datum/sada_ticket/events_ticket
 
 	/// Players left to describe in this fire, so a long run can resume next tick.
 	var/list/current_run
@@ -66,6 +67,10 @@ SUBSYSTEM_DEF(sada)
 */
 
 /datum/controller/subsystem/sada/Initialize()
+	if(world.maxx > 255 || world.maxy > 255 || world.maxz > 255)
+		stack_trace("world size [world.maxx]x[world.maxy]x[world.maxz] exceeds 255x255x255")
+		return SS_INIT_FAILURE
+
 	var/control_socket = CONFIG_GET(string/sada_control_socket)
 
 	if(!control_socket)
@@ -73,28 +78,19 @@ SUBSYSTEM_DEF(sada)
 
 	client_version = sada_get_version()
 
-	var/datum/sada_future/handshake = new(sada_init(control_socket))
-	var/response = handshake.wait()
-
-	var/failure = sada_error_of(response)
-
-	if(failure)
-		stack_trace("could not reach the voice server: [failure]")
+	var/datum/sada_response/version/response
+	try response = sada_init(control_socket).wait()
+	catch(var/error)
+		stack_trace("could not initialize the voice server: [error]")
 		return SS_INIT_FAILURE
 
-	var/list/reported = islist(response) ? response["version"] : null
-
-	if(isnull(reported))
-		stack_trace("the voice server answered the handshake with [json_encode(response)]")
-		return SS_INIT_FAILURE
-
-	var/protocol = reported["protocol"]
+	var/protocol = response.protocol
 
 	if(protocol != SADA_PROTOCOL_VERSION)
 		stack_trace("the server speaks protocol [protocol], this build speaks [SADA_PROTOCOL_VERSION]")
 		return SS_INIT_FAILURE
 
-	server_version = reported["version"]
+	server_version = response.version
 
 	return SS_INIT_SUCCESS
 
@@ -145,56 +141,68 @@ SUBSYSTEM_DEF(sada)
 /// it when describing everyone again is one cheap pass; this runs only on the error path.
 /datum/controller/subsystem/sada/proc/collect_failures()
 	var/failure = sada_take_error()
-	if(!failure)
-		return
+	var/has_failure = FALSE
 
-	stack_trace("sada fire: [failure]")
+	while(failure)
+		stack_trace("sada fire: [failure]")
+		failure = sada_take_error()
+		has_failure = TRUE
 
-	for(var/mob/living/player in GLOB.player_list)
-		player.sada_invalidate()
+	if(has_failure)
+		for(var/mob/living/player in GLOB.player_list)
+			player.sada_invalidate()
 
 /// Keeps exactly one event poll in flight: read the answer to the last one, then ask
 /// again. Latency is one fire, which is what auth and disconnect notices can afford.
 /datum/controller/subsystem/sada/proc/collect_events()
-	if(!events_ticket)
-		events_ticket = sada_poll_events(SADA_EVENTS_PER_POLL)
+	if(isnull(events_ticket))
+		try events_ticket = sada_poll_events(SADA_EVENTS_PER_POLL)
+		catch(var/error)
+			stack_trace("event poll failed: [error]")
 		return
 
-	var/raw = sada_poll(events_ticket)
+	var/raw = sada_poll(events_ticket.ticket)
 
-	if(raw == SADA_PENDING)
+	if(raw == 1) // pending
 		return
 
-	events_ticket = 0
+	events_ticket = null
 
-	if(raw == SADA_UNKNOWN)
+	if(isnull(raw)) // unknown
 		return
 
-	var/response = json_decode(raw)
-	var/failure = sada_error_of(response)
+	var/datum/sada_response/events/response = raw
+	var/datum/sada_response/error/error = astype(response)
 
-	if(failure)
-		stack_trace("event poll failed: [failure]")
+	if(!isnull(error))
+		stack_trace("event poll failed: [error.message]")
 		return
 
-	if(!islist(response))
-		stack_trace("event poll returned [json_encode(response)] instead of a list")
-		return
-
-	for(var/list/event as anything in response["events"])
+	for(var/datum/sada_event/event as anything in response.events)
 		handle_event(event)
 
-/datum/controller/subsystem/sada/proc/handle_event(list/event)
-	switch(event["type"])
-		if("authenticated")
-			on_authenticated(event["ckey"], event["session"])
-		if("disconnected")
-			on_disconnected(event["ckey"], event["session"])
+/datum/controller/subsystem/sada/proc/handle_event(datum/sada_event/event)
+	switch(event.type)
+		if(/datum/sada_event/authenticated)
+			var/datum/sada_event/authenticated/auth = event
+			on_authenticated(auth.player_id, auth.session)
+		if(/datum/sada_event/disconnected)
+			var/datum/sada_event/disconnected/disc = event
+			on_disconnected(disc.player_id, disc.session)
 		else
-			stack_trace("unknown event type [event["type"]]: [json_encode(event)]")
+			stack_trace("unknown event type [event.type]")
 
-/datum/controller/subsystem/sada/proc/on_authenticated(ckey, session)
-	var/client/player = GLOB.directory[ckey]
+/// The client the voice server knows by this player id, or null.
+///
+/// A scan rather than a lookup table: it only runs for authentication and disconnect
+/// notices, and a table would be one more thing to keep in step with clients leaving.
+/datum/controller/subsystem/sada/proc/client_of(player_id)
+	for(var/client/candidate as anything in GLOB.clients)
+		if(candidate.sada_id == player_id)
+			return candidate
+
+/datum/controller/subsystem/sada/proc/on_authenticated(id, session)
+	var/client/player = client_of(id)
 
 	if(isnull(player))
 		return
@@ -210,8 +218,8 @@ SUBSYSTEM_DEF(sada)
 		// them, and it starts them mute and deaf.
 		living.sada_reset()
 
-/datum/controller/subsystem/sada/proc/on_disconnected(ckey, session)
-	var/client/player = GLOB.directory[ckey]
+/datum/controller/subsystem/sada/proc/on_disconnected(id, session)
+	var/client/player = client_of(id)
 
 	// The player may already have reconnected on a newer session
 	if(isnull(player) || player.sada_session != session)
@@ -241,19 +249,21 @@ SUBSYSTEM_DEF(sada)
 /// code per player, so the one this returns is also the only one that still works.
 /datum/controller/subsystem/sada/proc/generate_auth_code(client/player)
 	if(isnull(player))
-		return null
+		return
+
+	var/id = player.sada_get_player_id()
+	if(!id)
+		return
 
 	var/code
 
 	do code = random_auth_code()
 	while (code in used_codes)
 
-	var/datum/sada_future/registered = new(sada_register_code(code, player.ckey))
-	var/failure = sada_error_of(registered.wait())
-
-	if(failure)
-		stack_trace("could not register an auth code for [key_name(player)]: [failure]")
-		return null
+	try sada_register_code(code, id, player.ckey).wait()
+	catch(var/error)
+		stack_trace("could not register an auth code for [key_name(player)]: [error]")
+		return
 
 	used_codes += code
 

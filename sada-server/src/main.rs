@@ -20,16 +20,16 @@ mod directory;
 mod http;
 mod proto;
 mod sfu;
-mod shutdown;
 mod ws;
 
 use std::{net::SocketAddr, sync::Arc};
 
+use sada_utils::shutdown::Shutdown;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::mpsc};
 use tracing_subscriber::EnvFilter;
 
-use crate::{config::Config, directory::Directory, http::AppState, sfu::Worker, shutdown::Shutdown};
+use crate::{config::Config, directory::Directory, http::AppState, sfu::Worker};
 
 /// How many SFU notifications may be queued for the directory.
 const SFU_EVENT_BUFFER: usize = 64;

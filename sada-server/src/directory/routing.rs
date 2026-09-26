@@ -7,22 +7,17 @@
 //! by local speech and by radio channel; which of those applies right now is decided by the speaker's current transmit
 //! intent, which arrives out of band and is applied immediately.
 
-use std::collections::{HashMap, HashSet};
-
-use sada_common::{Ckey, Freq, Position};
+use rustc_hash::{FxHashMap, FxHashSet};
+use sada_common::{Freq, PlayerId, Position};
 
 use super::player::PlayerState;
 use crate::directory::player::PlayerTable;
 
 /// Empty listener list, returned for speakers nobody can hear.
-const NO_LISTENERS: &[Ckey] = &[];
+const NO_LISTENERS: &[PlayerId] = &[];
 
 /// The routing policy currently in force.
 #[derive(Debug, Default)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a snapshot is built once per batch and moved once, straight into an Arc"
-)]
 pub enum Routing {
     /// Everyone hears everyone else.
     ///
@@ -38,29 +33,29 @@ pub enum Routing {
 #[derive(Debug, Default, PartialEq)]
 pub struct RoutingTable {
     /// Players the game currently permits to speak.
-    speakers: HashSet<Ckey>,
+    speakers: FxHashSet<PlayerId>,
     /// Listeners for local speech, by speaker.
-    local: HashMap<Ckey, Vec<Ckey>>,
+    local: FxHashMap<PlayerId, Vec<PlayerId>>,
     /// Listeners tuned to each radio frequency.
     ///
     /// Radio reception does not depend on who is transmitting, so this is keyed
     /// by frequency alone; the speaker is excluded when the set is read.
-    radio: HashMap<Freq, Vec<Ckey>>,
+    radio: FxHashMap<Freq, Vec<PlayerId>>,
     /// Frequencies each speaker is allowed to transmit on.
-    hot: HashMap<Ckey, Vec<Freq>>,
+    hot: FxHashMap<PlayerId, Vec<Freq>>,
     /// Where each player the game has placed is standing.
-    positions: HashMap<Ckey, Position>,
+    positions: FxHashMap<PlayerId, Position>,
 }
 
 impl RoutingTable {
     /// Whether the game permits `speaker` to be heard at all.
     #[must_use]
-    pub fn can_speak(&self, speaker: &Ckey) -> bool { self.speakers.contains(speaker) }
+    pub fn can_speak(&self, speaker: PlayerId) -> bool { self.speakers.contains(&speaker) }
 
     /// Players who hear `speaker` talking locally.
     #[must_use]
-    pub fn local_listeners(&self, speaker: &Ckey) -> &[Ckey] {
-        self.local.get(speaker).map_or(NO_LISTENERS, Vec::as_slice)
+    pub fn local_listeners(&self, speaker: PlayerId) -> &[PlayerId] {
+        self.local.get(&speaker).map_or(NO_LISTENERS, Vec::as_slice)
     }
 
     /// Players tuned to `channel`.
@@ -68,7 +63,7 @@ impl RoutingTable {
     /// The speaker may appear in the result and is filtered out by the caller,
     /// which already skips relaying a frame back to its origin.
     #[must_use]
-    pub fn radio_listeners(&self, channel: Freq) -> &[Ckey] {
+    pub fn radio_listeners(&self, channel: Freq) -> &[PlayerId] {
         self.radio.get(&channel).map_or(NO_LISTENERS, Vec::as_slice)
     }
 
@@ -78,13 +73,13 @@ impl RoutingTable {
     /// this is checked before relaying radio speech rather than trusting the
     /// frequency the transmit intent names.
     #[must_use]
-    pub fn can_transmit_on(&self, speaker: &Ckey, channel: Freq) -> bool {
-        self.hot.get(speaker).is_some_and(|hot| hot.contains(&channel))
+    pub fn can_transmit_on(&self, speaker: PlayerId, channel: Freq) -> bool {
+        self.hot.get(&speaker).is_some_and(|hot| hot.contains(&channel))
     }
 
     /// Where a player is standing, if the game has said.
     #[must_use]
-    pub fn position(&self, ckey: &Ckey) -> Option<Position> { self.positions.get(ckey).copied() }
+    pub fn position(&self, player: PlayerId) -> Option<Position> { self.positions.get(&player).copied() }
 }
 
 /// Turns game state into a routing table.
@@ -122,7 +117,7 @@ impl Router for HearerListRouter {
     fn compute(&self, players: &PlayerTable) -> Routing {
         let mut table = base_table(players);
 
-        for (ckey, state) in players.iter() {
+        for (player, state) in players.iter() {
             if !state.can_speak() {
                 continue;
             }
@@ -130,12 +125,12 @@ impl Router for HearerListRouter {
             let listeners = state
                 .local_with
                 .iter()
-                .filter(|listener| *listener != ckey && can_hear(players, listener))
-                .cloned()
+                .copied()
+                .filter(|listener| *listener != player && can_hear(players, *listener))
                 .collect::<Vec<_>>();
 
             if !listeners.is_empty() {
-                table.local.insert(ckey.clone(), listeners);
+                table.local.insert(player, listeners);
             }
         }
 
@@ -173,7 +168,7 @@ impl Router for ProximityRouter {
     fn compute(&self, players: &PlayerTable) -> Routing {
         let mut table = base_table(players);
 
-        for (ckey, state) in players.iter() {
+        for (player, state) in players.iter() {
             let (true, Some(origin)) = (state.can_speak(), state.position) else {
                 continue;
             };
@@ -181,15 +176,15 @@ impl Router for ProximityRouter {
             let listeners = players
                 .iter()
                 .filter(|(listener, other)| {
-                    *listener != ckey
+                    *listener != player
                         && other.can_hear()
                         && other.position.is_some_and(|there| self.in_range(origin, there))
                 })
-                .map(|(listener, _)| listener.clone())
+                .map(|(listener, _)| listener)
                 .collect::<Vec<_>>();
 
             if !listeners.is_empty() {
-                table.local.insert(ckey.clone(), listeners);
+                table.local.insert(player, listeners);
             }
         }
 
@@ -202,20 +197,20 @@ impl Router for ProximityRouter {
 /// Radio reception and speech permission come straight from game state and do not depend on how local audibility is
 /// decided.
 fn base_table(players: &PlayerTable) -> RoutingTable {
-    let mut speakers = HashSet::new();
-    let mut radio: HashMap<Freq, Vec<Ckey>> = HashMap::new();
-    let mut hot: HashMap<Ckey, Vec<Freq>> = HashMap::new();
-    let mut positions = HashMap::new();
+    let mut speakers = FxHashSet::default();
+    let mut radio: FxHashMap<Freq, Vec<PlayerId>> = FxHashMap::default();
+    let mut hot = FxHashMap::default();
+    let mut positions = FxHashMap::default();
 
-    for (ckey, state) in players.iter() {
+    for (player, state) in players.iter() {
         if let Some(position) = state.position {
-            positions.insert(ckey.clone(), position);
+            positions.insert(player, position);
         }
 
         if state.can_speak() {
-            speakers.insert(ckey.clone());
+            speakers.insert(player);
             if !state.hot_freqs.is_empty() {
-                hot.insert(ckey.clone(), state.hot_freqs.clone());
+                hot.insert(player, state.hot_freqs.clone());
             }
         }
 
@@ -224,13 +219,13 @@ fn base_table(players: &PlayerTable) -> RoutingTable {
         }
 
         for &channel in &state.hear_freqs {
-            radio.entry(channel).or_default().push(ckey.clone());
+            radio.entry(channel).or_default().push(player);
         }
     }
 
     RoutingTable {
         speakers,
-        local: HashMap::new(),
+        local: FxHashMap::default(),
         radio,
         hot,
         positions,
@@ -238,20 +233,56 @@ fn base_table(players: &PlayerTable) -> RoutingTable {
 }
 
 /// Whether a player exists and is able to hear.
-fn can_hear(players: &PlayerTable, ckey: &Ckey) -> bool { players.get(ckey).is_some_and(PlayerState::can_hear) }
+fn can_hear(players: &PlayerTable, player: PlayerId) -> bool { players.get(player).is_some_and(PlayerState::can_hear) }
 
 #[cfg(test)]
 mod tests {
-    use sada_common::{Ckey, Freq, PlayerPatch, Position};
+    use sada_common::{Freq, PlayerId, PlayerPatch, Position};
 
     use super::{BroadcastRouter, HearerListRouter, ProximityRouter, Router, Routing, RoutingTable};
     use crate::directory::player::PlayerTable;
 
+    /// A player in the fixtures below.
+    const ANYONE: PlayerId = PlayerId::from_raw(1);
+
+    /// A player in the fixtures below.
+    const SPEAKER: PlayerId = PlayerId::from_raw(2);
+
+    /// A player in the fixtures below.
+    const NEAR: PlayerId = PlayerId::from_raw(3);
+
+    /// A player in the fixtures below.
+    const FAR: PlayerId = PlayerId::from_raw(4);
+
+    /// A player in the fixtures below.
+    const DEAFENED: PlayerId = PlayerId::from_raw(5);
+
+    /// A player in the fixtures below.
+    const HEARING: PlayerId = PlayerId::from_raw(6);
+
+    /// A player in the fixtures below.
+    const ASSISTANT: PlayerId = PlayerId::from_raw(7);
+
+    /// A player in the fixtures below.
+    const SECURITY_OFFICER: PlayerId = PlayerId::from_raw(8);
+
+    /// A player in the fixtures below.
+    const CORNER: PlayerId = PlayerId::from_raw(9);
+
+    /// A player in the fixtures below.
+    const OUTSIDE: PlayerId = PlayerId::from_raw(10);
+
+    /// A player in the fixtures below.
+    const UPSTAIRS: PlayerId = PlayerId::from_raw(11);
+
+    /// A player in the fixtures below.
+    const NOWHERE: PlayerId = PlayerId::from_raw(12);
+
     /// Build a table from a list of players and their patches.
-    fn table_of(players: &[(&str, PlayerPatch)]) -> PlayerTable {
+    fn table_of(players: &[(PlayerId, PlayerPatch)]) -> PlayerTable {
         let mut table = PlayerTable::new();
-        for (ckey, patch) in players {
-            table.apply(Ckey::from(*ckey), patch.clone());
+        for (player, patch) in players {
+            table.apply(*player, patch.clone());
         }
         table
     }
@@ -273,16 +304,16 @@ mod tests {
         }
     }
 
-    /// Listener list as owned strings, sorted for comparison.
-    fn sorted(listeners: &[Ckey]) -> Vec<String> {
-        let mut names = listeners.iter().map(ToString::to_string).collect::<Vec<_>>();
-        names.sort();
-        names
+    /// Listener list, sorted for comparison.
+    fn sorted(listeners: &[PlayerId]) -> Vec<PlayerId> {
+        let mut listeners = listeners.to_vec();
+        listeners.sort_unstable();
+        listeners
     }
 
     #[test]
     fn broadcast_ignores_game_state_entirely() {
-        let players = table_of(&[("a", present())]);
+        let players = table_of(&[(ANYONE, present())]);
         assert!(matches!(BroadcastRouter.compute(&players), Routing::Unrestricted));
     }
 
@@ -290,102 +321,102 @@ mod tests {
     fn hearer_list_relays_along_the_game_s_own_list() {
         let players = table_of(&[
             (
-                "speaker",
+                SPEAKER,
                 PlayerPatch {
-                    local_with: Some(vec!["near".into()]),
+                    local_with: Some(vec![NEAR]),
                     ..present()
                 },
             ),
-            ("near", present()),
-            ("far", present()),
+            (NEAR, present()),
+            (FAR, present()),
         ]);
 
         let table = explicit(HearerListRouter.compute(&players));
 
-        assert_eq!(sorted(table.local_listeners(&"speaker".into())), ["near"]);
-        assert!(table.local_listeners(&"far".into()).is_empty());
+        assert_eq!(sorted(table.local_listeners(SPEAKER)), vec![NEAR]);
+        assert!(table.local_listeners(FAR).is_empty());
     }
 
     #[test]
     fn a_muted_speaker_reaches_nobody() {
         let players = table_of(&[
             (
-                "speaker",
+                SPEAKER,
                 PlayerPatch {
                     mute: Some(true),
                     deaf: Some(false),
-                    local_with: Some(vec!["near".into()]),
+                    local_with: Some(vec![NEAR]),
                     ..Default::default()
                 },
             ),
-            ("near", present()),
+            (NEAR, present()),
         ]);
 
         let table = explicit(HearerListRouter.compute(&players));
 
-        assert!(!table.can_speak(&"speaker".into()));
-        assert!(table.local_listeners(&"speaker".into()).is_empty());
+        assert!(!table.can_speak(SPEAKER));
+        assert!(table.local_listeners(SPEAKER).is_empty());
     }
 
     #[test]
     fn a_deaf_listener_is_dropped_from_the_list() {
         let players = table_of(&[
             (
-                "speaker",
+                SPEAKER,
                 PlayerPatch {
-                    local_with: Some(vec!["deafened".into(), "hearing".into()]),
+                    local_with: Some(vec![DEAFENED, HEARING]),
                     ..present()
                 },
             ),
             (
-                "deafened",
+                DEAFENED,
                 PlayerPatch {
                     deaf: Some(true),
                     ..present()
                 },
             ),
-            ("hearing", present()),
+            (HEARING, present()),
         ]);
 
         let table = explicit(HearerListRouter.compute(&players));
 
-        assert_eq!(sorted(table.local_listeners(&"speaker".into())), ["hearing"]);
+        assert_eq!(sorted(table.local_listeners(SPEAKER)), vec![HEARING]);
     }
 
     #[test]
     fn a_speaker_is_never_their_own_listener() {
         let players = table_of(&[(
-            "speaker",
+            SPEAKER,
             PlayerPatch {
-                local_with: Some(vec!["speaker".into()]),
+                local_with: Some(vec![SPEAKER]),
                 ..present()
             },
         )]);
 
         let table = explicit(HearerListRouter.compute(&players));
 
-        assert!(table.local_listeners(&"speaker".into()).is_empty());
+        assert!(table.local_listeners(SPEAKER).is_empty());
     }
 
     #[test]
     fn radio_listeners_are_keyed_by_frequency() {
         let players = table_of(&[
             (
-                "speaker",
+                SPEAKER,
                 PlayerPatch {
                     hot_freqs: Some(vec![Freq(1459)]),
                     ..present()
                 },
             ),
             (
-                "common",
+                ASSISTANT,
                 PlayerPatch {
                     hear_freqs: Some(vec![Freq(1459)]),
                     ..present()
                 },
             ),
             (
-                "security",
+                SECURITY_OFFICER,
                 PlayerPatch {
                     hear_freqs: Some(vec![Freq(1359)]),
                     ..present()
@@ -395,15 +426,15 @@ mod tests {
 
         let table = explicit(HearerListRouter.compute(&players));
 
-        assert_eq!(sorted(table.radio_listeners(Freq(1459))), ["common"]);
-        assert_eq!(sorted(table.radio_listeners(Freq(1359))), ["security"]);
+        assert_eq!(sorted(table.radio_listeners(Freq(1459))), vec![ASSISTANT]);
+        assert_eq!(sorted(table.radio_listeners(Freq(1359))), vec![SECURITY_OFFICER]);
         assert!(table.radio_listeners(Freq(1)).is_empty());
     }
 
     #[test]
     fn transmitting_needs_the_frequency_to_be_hot() {
         let players = table_of(&[(
-            "speaker",
+            SPEAKER,
             PlayerPatch {
                 hot_freqs: Some(vec![Freq(1459)]),
                 ..present()
@@ -412,15 +443,15 @@ mod tests {
 
         let table = explicit(HearerListRouter.compute(&players));
 
-        assert!(table.can_transmit_on(&"speaker".into(), Freq(1459)));
+        assert!(table.can_transmit_on(SPEAKER, Freq(1459)));
         // Listening to a channel does not grant the right to talk on it.
-        assert!(!table.can_transmit_on(&"speaker".into(), Freq(1359)));
+        assert!(!table.can_transmit_on(SPEAKER, Freq(1359)));
     }
 
     #[test]
     fn a_deaf_player_hears_no_radio() {
         let players = table_of(&[(
-            "deafened",
+            DEAFENED,
             PlayerPatch {
                 deaf: Some(true),
                 hear_freqs: Some(vec![Freq(1459)]),
@@ -438,7 +469,7 @@ mod tests {
         let router = ProximityRouter { radius: 7 };
         let players = table_of(&[
             (
-                "speaker",
+                SPEAKER,
                 PlayerPatch {
                     position: Some(Position { x: 0, y: 0, z: 1 }),
                     ..present()
@@ -446,14 +477,14 @@ mod tests {
             ),
             // Diagonally 7 away: inside a Chebyshev radius, outside a Euclidean one.
             (
-                "corner",
+                CORNER,
                 PlayerPatch {
                     position: Some(Position { x: 7, y: 7, z: 1 }),
                     ..present()
                 },
             ),
             (
-                "outside",
+                OUTSIDE,
                 PlayerPatch {
                     position: Some(Position { x: 8, y: 0, z: 1 }),
                     ..present()
@@ -463,21 +494,21 @@ mod tests {
 
         let table = explicit(router.compute(&players));
 
-        assert_eq!(sorted(table.local_listeners(&"speaker".into())), ["corner"]);
+        assert_eq!(sorted(table.local_listeners(SPEAKER)), vec![CORNER]);
     }
 
     #[test]
     fn proximity_never_carries_between_z_levels() {
         let players = table_of(&[
             (
-                "speaker",
+                SPEAKER,
                 PlayerPatch {
                     position: Some(Position { x: 0, y: 0, z: 1 }),
                     ..present()
                 },
             ),
             (
-                "upstairs",
+                UPSTAIRS,
                 PlayerPatch {
                     position: Some(Position { x: 0, y: 0, z: 2 }),
                     ..present()
@@ -487,24 +518,24 @@ mod tests {
 
         let table = explicit(ProximityRouter::default().compute(&players));
 
-        assert!(table.local_listeners(&"speaker".into()).is_empty());
+        assert!(table.local_listeners(SPEAKER).is_empty());
     }
 
     #[test]
     fn proximity_ignores_players_with_no_known_position() {
         let players = table_of(&[
             (
-                "speaker",
+                SPEAKER,
                 PlayerPatch {
                     position: Some(Position { x: 0, y: 0, z: 1 }),
                     ..present()
                 },
             ),
-            ("nowhere", present()),
+            (NOWHERE, present()),
         ]);
 
         let table = explicit(ProximityRouter::default().compute(&players));
 
-        assert!(table.local_listeners(&"speaker".into()).is_empty());
+        assert!(table.local_listeners(SPEAKER).is_empty());
     }
 }

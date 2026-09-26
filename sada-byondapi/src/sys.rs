@@ -2,13 +2,10 @@
 //!
 //! Re-exports the generated types and adds what bindgen cannot.
 
-use std::{cell::RefCell, ffi::CString};
+use std::cell::RefCell;
 
-use crate::BYONDAPI;
 pub use crate::bindings::*;
-
-impl !Send for CByondValue {}
-impl !Sync for CByondValue {}
+use crate::{BYONDAPI, byond};
 
 impl CByondValue {
     /// The null value, which is also what a zeroed struct means.
@@ -35,6 +32,10 @@ impl CByondValue {
     }
 }
 
+impl const Default for CByondValue {
+    fn default() -> Self { CByondValue::NULL }
+}
+
 impl std::fmt::Debug for CByondValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hint = match self.type_ {
@@ -57,6 +58,12 @@ impl std::fmt::Debug for CByondValue {
     }
 }
 
+impl PartialEq for CByondValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_ == other.type_ && unsafe { self.data.ref_ } == unsafe { other.data.ref_ }
+    }
+}
+
 impl From<()> for CByondValue {
     fn from(_: ()) -> Self { CByondValue::NULL }
 }
@@ -65,7 +72,15 @@ impl From<CByondValue> for () {
     fn from(_: CByondValue) -> Self {}
 }
 
-impl From<u16> for CByondValue {
+impl const From<bool> for CByondValue {
+    fn from(value: bool) -> Self { CByondValue::number(if value { 1.0 } else { 0.0 }) }
+}
+
+impl From<CByondValue> for bool {
+    fn from(value: CByondValue) -> Self { unsafe { value.data.num != 0. } }
+}
+
+impl const From<u16> for CByondValue {
     fn from(value: u16) -> Self { CByondValue::number(value as f32) }
 }
 
@@ -81,6 +96,14 @@ impl From<CByondValue> for i16 {
     fn from(value: CByondValue) -> Self { (unsafe { value.data.num }) as i16 }
 }
 
+impl From<f32> for CByondValue {
+    fn from(value: f32) -> Self { CByondValue::number(value) }
+}
+
+impl From<CByondValue> for f32 {
+    fn from(value: CByondValue) -> Self { unsafe { value.data.num } }
+}
+
 impl From<String> for CByondValue {
     fn from(value: String) -> Self {
         let mut string = value.into_bytes();
@@ -94,28 +117,40 @@ impl From<String> for CByondValue {
 }
 
 impl From<CByondValue> for String {
-    fn from(value: CByondValue) -> Self {
-        let mut buf = vec![0u8; 256];
-        let mut len = buf.len() as u32;
+    fn from(value: CByondValue) -> Self { byond::to_string(value) }
+}
 
-        while !unsafe { BYONDAPI.Byond_ToString(&value, buf.as_mut_ptr() as _, &mut len) } {
-            if len == 0 {
-                return String::new();
-            }
-            buf.resize(len as usize, 0);
-        }
+impl<T> From<Option<T>> for CByondValue
+where
+    T: Into<CByondValue>,
+{
+    fn from(value: Option<T>) -> Self { value.map(Into::into).unwrap_or(Self::NULL) }
+}
 
-        buf.truncate(len as usize);
+#[cfg(feature = "sada")]
+impl<T, E> From<Result<T, E>> for CByondValue
+where
+    T: Into<CByondValue>,
+    E: Into<CByondValue>,
+{
+    fn from(value: Result<T, E>) -> Self {
+        use crate::byond;
 
-        CString::from_vec_with_nul(buf)
-            .ok()
-            .and_then(|cstr| cstr.into_string().ok())
-            .unwrap_or_default()
+        let (ok, payload) = match value {
+            Ok(ok) => (true, ok.into()),
+            Err(err) => (false, err.into()),
+        };
+
+        let value = byond::new(c"/datum/sada_result", &[CByondValue::from(ok), payload]);
+
+        byond::value_decref(&payload);
+
+        value
     }
 }
 
 thread_local! {
-    static LAST_CRASH: RefCell<String> = const {RefCell::new(String::new())};
+    static LAST_CRASH: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// Raise a runtime error in the DM proc that called us, and never come back.

@@ -44,6 +44,7 @@ use sada_common::{
     ControlRequest,
     ControlResponse,
     Freq,
+    PlayerId,
     PlayerPatch,
     Position,
     SessionId,
@@ -152,8 +153,10 @@ enum Talking {
 
 /// The state of one crew member, as the game sees them.
 struct Player {
-    /// Player key, the identity the server knows them by.
+    /// Player key, which is what the game itself knows them by.
     ckey: Ckey,
+    /// Id this game gave them, which is how the voice server knows them.
+    player_id: PlayerId,
     /// Character drawn on the map.
     glyph: char,
     /// Where they are standing.
@@ -188,7 +191,7 @@ struct Player {
 
 impl Player {
     /// Create a crew member standing at `x`, `y` with `department`'s radio.
-    fn new(ckey: &str, glyph: char, x: i32, y: i32, department: usize) -> Self {
+    fn new(player_id: PlayerId, ckey: &str, glyph: char, x: i32, y: i32, department: usize) -> Self {
         let mut freqs = vec![CHANNELS[0].freq];
 
         if let Some(channel) = CHANNELS.get(department).filter(|_| department != 0) {
@@ -197,6 +200,7 @@ impl Player {
 
         Self {
             ckey: Ckey::from(ckey),
+            player_id,
             glyph,
             position: Position { x, y, z: 2 },
             mute: false,
@@ -219,7 +223,7 @@ impl Player {
     fn carries(&self, freq: Freq) -> bool { self.hot.contains(&freq) }
 
     /// Build the state to push, given the earshot list the game computed.
-    fn snapshot(&self, local_with: Vec<Ckey>) -> Snapshot {
+    fn snapshot(&self, local_with: Vec<PlayerId>) -> Snapshot {
         Snapshot {
             mute: self.mute,
             deaf: self.deaf,
@@ -251,7 +255,7 @@ struct Snapshot {
     /// Where they are standing.
     position: Position,
     /// Who is in earshot of them.
-    local_with: Vec<Ckey>,
+    local_with: Vec<PlayerId>,
     /// Frequencies their headset can transmit on.
     hot: Vec<Freq>,
     /// Frequencies their headset receives.
@@ -467,6 +471,8 @@ struct App {
     seed: u64,
     /// Number of crew added since startup, used to name them.
     spawned: usize,
+    /// Id the next crew member is given.
+    next_player: u32,
 }
 
 impl App {
@@ -474,8 +480,12 @@ impl App {
     fn new(path: String) -> Self {
         let players = CREW
             .iter()
-            .map(|&(ckey, glyph, x, y, department)| Player::new(ckey, glyph, x, y, department))
-            .collect();
+            .zip(1..)
+            .map(|(&(ckey, glyph, x, y, department), id)| {
+                Player::new(PlayerId::from_raw(id), ckey, glyph, x, y, department)
+            })
+            .collect::<Vec<_>>();
+        let next_player = players.len() as u32 + 1;
 
         Self {
             control: Control::new(path),
@@ -494,6 +504,7 @@ impl App {
                 .map_or(0x9E37_79B9_7F4A_7C15, |since| since.as_nanos() as u64)
                 | 1,
             spawned: 0,
+            next_player,
         }
     }
 
@@ -600,7 +611,7 @@ impl App {
 
             if !patch.is_empty() {
                 requests.push(ControlRequest::PatchPlayer {
-                    ckey: player.ckey.clone(),
+                    player: player.player_id,
                     patch,
                 });
                 commits.push(Commit::Patch {
@@ -680,19 +691,21 @@ impl App {
     /// React to one event the server queued for the game.
     fn on_event(&mut self, event: ControlEvent) {
         match event {
-            ControlEvent::Authenticated { ckey, session } => {
-                self.log(LogKind::Event, format!("{ckey} authenticated as session {session}"));
+            ControlEvent::Authenticated { player, session } => {
+                let who = self.name_of(player);
+                self.log(LogKind::Event, format!("{who} authenticated as session {session}"));
 
-                if let Some(player) = self.player_mut(&ckey) {
+                if let Some(player) = self.player_mut(player) {
                     player.session = Some(session);
                     player.code = None;
                     player.sent_talking = None;
                 }
             },
-            ControlEvent::Disconnected { ckey, session } => {
-                self.log(LogKind::Event, format!("{ckey} lost session {session}"));
+            ControlEvent::Disconnected { player, session } => {
+                let who = self.name_of(player);
+                self.log(LogKind::Event, format!("{who} lost session {session}"));
 
-                if let Some(player) = self.player_mut(&ckey)
+                if let Some(player) = self.player_mut(player)
                     && player.session == Some(session)
                 {
                     player.session = None;
@@ -700,7 +713,12 @@ impl App {
                 }
             },
             ControlEvent::Speaking { speaker, listeners } => {
-                let heard = listeners.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+                let heard = listeners
+                    .iter()
+                    .map(|&listener| self.name_of(listener))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let speaker = self.name_of(speaker);
                 self.log(LogKind::Event, format!("{speaker} heard by [{heard}]"));
             },
             ControlEvent::Heard {
@@ -711,6 +729,7 @@ impl App {
             } => {
                 let where_ = channel.map_or_else(|| "locally".to_owned(), |freq| format!("on {}", freq.0));
                 let language = language.unwrap_or_else(|| "?".to_owned());
+                let (speaker, listener) = (self.name_of(speaker), self.name_of(listener));
                 self.log(
                     LogKind::Event,
                     format!("{listener} heard {speaker} {where_} in {language}"),
@@ -766,7 +785,7 @@ impl App {
     ///
     /// This is the game's job in the real system too: only it knows about walls, doors and holopads. The simulation
     /// approximates that with plain distance on the same z-level.
-    fn earshot(&self, index: usize) -> Vec<Ckey> {
+    fn earshot(&self, index: usize) -> Vec<PlayerId> {
         let origin = self.players[index].position;
 
         self.players
@@ -778,13 +797,21 @@ impl App {
                     && (player.position.x - origin.x).abs() <= HEARING_RADIUS
                     && (player.position.y - origin.y).abs() <= HEARING_RADIUS
             })
-            .map(|(_, player)| player.ckey.clone())
+            .map(|(_, player)| player.player_id)
             .collect()
     }
 
-    /// Find a crew member by key.
-    fn player_mut(&mut self, ckey: &Ckey) -> Option<&mut Player> {
-        self.players.iter_mut().find(|player| &player.ckey == ckey)
+    /// Find a crew member by the id this game gave them.
+    fn player_mut(&mut self, id: PlayerId) -> Option<&mut Player> {
+        self.players.iter_mut().find(|player| player.player_id == id)
+    }
+
+    /// Name a player for the log, falling back to the id for one who has already left.
+    fn name_of(&self, id: PlayerId) -> String {
+        self.players
+            .iter()
+            .find(|player| player.player_id == id)
+            .map_or_else(|| format!("player {id}"), |player| player.ckey.to_string())
     }
 
     /// Apply one key press.
@@ -914,13 +941,18 @@ impl App {
 
     /// Mint a code for the selected crew member and register it.
     fn mint_code(&mut self) {
-        let Some(ckey) = self.players.get(self.selected).map(|player| player.ckey.clone()) else {
+        let Some((player, ckey)) = self
+            .players
+            .get(self.selected)
+            .map(|player| (player.player_id, player.ckey.clone()))
+        else {
             return;
         };
         let code = self.generate_code();
 
         let request = ControlRequest::RegisterCode {
             code: code.clone(),
+            player,
             ckey: ckey.clone(),
         };
 
@@ -939,11 +971,15 @@ impl App {
 
     /// Ask the server which session the selected crew member holds.
     fn check_auth(&mut self) {
-        let Some(ckey) = self.players.get(self.selected).map(|player| player.ckey.clone()) else {
+        let Some((player, ckey)) = self
+            .players
+            .get(self.selected)
+            .map(|player| (player.player_id, player.ckey.clone()))
+        else {
             return;
         };
 
-        match self.control.call(&ControlRequest::CheckAuth { ckey: ckey.clone() }) {
+        match self.control.call(&ControlRequest::CheckAuth { player }) {
             Some(ControlResponse::Session { session }) => {
                 let answer = session.map_or_else(|| "not authenticated".to_owned(), |id| format!("session {id}"));
                 self.log(LogKind::Action, format!("{ckey}: {answer}"));
@@ -966,7 +1002,10 @@ impl App {
         let y = (self.next_random() % MAP_HEIGHT as u64) as i32;
         let department = (self.next_random() % CHANNELS.len() as u64) as usize;
 
-        self.players.push(Player::new(&name, glyph, x, y, department));
+        let id = PlayerId::from_raw(self.next_player);
+        self.next_player += 1;
+
+        self.players.push(Player::new(id, &name, glyph, x, y, department));
 
         self.log(LogKind::Action, format!("{name} joined at ({x}, {y})"));
     }
@@ -983,7 +1022,7 @@ impl App {
         self.crew_state.select(Some(self.selected));
 
         match self.control.call(&ControlRequest::RemovePlayer {
-            ckey: player.ckey.clone(),
+            player: player.player_id,
         }) {
             Some(ControlResponse::Ok) => self.log(LogKind::Action, format!("{} left the round", player.ckey)),
             Some(other) => self.log(LogKind::Error, format!("remove-player refused: {other:?}")),

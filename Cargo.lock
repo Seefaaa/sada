@@ -787,6 +787,9 @@ name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+dependencies = [
+ "getrandom 0.3.4",
+]
 
 [[package]]
 name = "filedescriptor"
@@ -822,6 +825,18 @@ name = "flagset"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
+
+[[package]]
+name = "flume"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
+dependencies = [
+ "fastrand",
+ "futures-core",
+ "futures-sink",
+ "spin",
+]
 
 [[package]]
 name = "fnv"
@@ -919,9 +934,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2007,24 +2024,19 @@ dependencies = [
  "doxygen-rs",
  "libloading 0.9.0",
  "paste",
+ "sada-utils",
+ "tokio",
 ]
 
 [[package]]
 name = "sada-client"
 version = "0.1.0"
 dependencies = [
+ "flume",
  "sada-byondapi",
  "sada-common",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "sada-client-async"
-version = "0.1.0"
-dependencies = [
- "libloading 0.9.0",
- "paste",
  "tokio",
 ]
 
@@ -2033,6 +2045,7 @@ name = "sada-common"
 version = "0.1.0"
 dependencies = [
  "postcard",
+ "sada-byondapi",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -2047,7 +2060,9 @@ dependencies = [
  "hound",
  "opus",
  "ratatui",
+ "rustc-hash",
  "sada-common",
+ "sada-utils",
  "serde",
  "serde_json",
  "str0m",
@@ -2057,6 +2072,13 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sada-utils"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

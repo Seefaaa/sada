@@ -11,6 +11,7 @@ use std::{
 };
 
 use sada_common::{ControlFrameBuffer, ControlRequest, ControlResponse, PROTOCOL_VERSION};
+use sada_utils::shutdown::Shutdown;
 use thiserror::Error;
 use tokio::{
     fs,
@@ -18,10 +19,7 @@ use tokio::{
     sync::Semaphore,
 };
 
-use crate::{
-    directory::{DirectoryCommand, DirectoryHandle},
-    shutdown::Shutdown,
-};
+use crate::directory::{DirectoryCommand, DirectoryHandle};
 
 /// Maximum number of simultaneous control clients.
 ///
@@ -109,13 +107,15 @@ async fn handle(request: ControlRequest, directory: &DirectoryHandle, top_level:
             version: env!("CARGO_PKG_VERSION").to_owned(),
         },
 
-        ControlRequest::RegisterCode { code, ckey } => {
-            directory.send(DirectoryCommand::RegisterCode { code, ckey }).await;
+        ControlRequest::RegisterCode { code, player, ckey } => {
+            directory
+                .send(DirectoryCommand::RegisterCode { code, player, ckey })
+                .await;
             ControlResponse::Ok
         },
 
-        ControlRequest::CheckAuth { ckey } => ControlResponse::Session {
-            session: directory.check_auth(ckey).await,
+        ControlRequest::CheckAuth { player } => ControlResponse::Session {
+            session: directory.check_auth(player).await,
         },
 
         ControlRequest::SetTransmit { session, transmit } => {
@@ -125,13 +125,13 @@ async fn handle(request: ControlRequest, directory: &DirectoryHandle, top_level:
             ControlResponse::Ok
         },
 
-        ControlRequest::PatchPlayer { ckey, patch } => {
-            directory.send(DirectoryCommand::PatchPlayer { ckey, patch }).await;
+        ControlRequest::PatchPlayer { player, patch } => {
+            directory.send(DirectoryCommand::PatchPlayer { player, patch }).await;
             ControlResponse::Ok
         },
 
-        ControlRequest::RemovePlayer { ckey } => {
-            directory.send(DirectoryCommand::RemovePlayer { ckey }).await;
+        ControlRequest::RemovePlayer { player } => {
+            directory.send(DirectoryCommand::RemovePlayer { player }).await;
             ControlResponse::Ok
         },
 
