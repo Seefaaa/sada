@@ -111,9 +111,7 @@ impl TryFrom<sada_byondapi::sys::CByondValue> for PlayerPatch {
         let mut patch = Self::default();
         let mut refused = None;
 
-        for pair in list.chunks_exact(2) {
-            let [key, value] = *pair else { continue };
-
+        for &[key, value] in list.as_chunks::<2>().0 {
             if let Err(err) = patch.set(&String::from(key), value) {
                 refused.get_or_insert(err);
             }

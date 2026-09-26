@@ -32,7 +32,7 @@ impl CByondValue {
     }
 }
 
-impl const Default for CByondValue {
+const impl Default for CByondValue {
     fn default() -> Self { CByondValue::NULL }
 }
 
@@ -72,7 +72,7 @@ impl From<CByondValue> for () {
     fn from(_: CByondValue) -> Self {}
 }
 
-impl const From<bool> for CByondValue {
+const impl From<bool> for CByondValue {
     fn from(value: bool) -> Self { CByondValue::number(if value { 1.0 } else { 0.0 }) }
 }
 
@@ -80,7 +80,7 @@ impl From<CByondValue> for bool {
     fn from(value: CByondValue) -> Self { unsafe { value.data.num != 0. } }
 }
 
-impl const From<u16> for CByondValue {
+const impl From<u16> for CByondValue {
     fn from(value: u16) -> Self { CByondValue::number(value as f32) }
 }
 

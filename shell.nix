@@ -2,7 +2,7 @@
   pkgs ? import <nixpkgs> { overlays = [ (import <rust-overlay>) ]; }
 }:
 let
-  toolchain = pkgs.rust-bin.nightly.latest.default.override {
+  toolchain = pkgs.rust-bin.nightly."2026-09-26".default.override {
     targets = [ "x86_64-unknown-linux-gnu" "i686-unknown-linux-gnu" ];
     extensions = [ "rust-src" "rust-analyzer" "clippy" ];
   };
