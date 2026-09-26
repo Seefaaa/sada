@@ -1,6 +1,7 @@
-#![feature(macro_attr, const_trait_impl, const_convert)]
-
 //! A bridge library between game server and VC server.
+
+#![cfg(target_os = "linux")]
+#![feature(macro_attr, const_trait_impl, const_convert)]
 
 mod control;
 mod player;
