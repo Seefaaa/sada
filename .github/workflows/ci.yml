@@ -154,3 +154,13 @@ jobs:
 
       - name: Type-check and build
         run: bun run build
+
+  completion-gate:
+    name: Completion gate
+    runs-on: ubuntu-latest
+    needs: [changes, lint, rust, windows, web]
+    if: always() && !cancelled()
+    steps:
+      - name: Collect job results
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
