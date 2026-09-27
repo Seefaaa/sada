@@ -6,6 +6,7 @@
  * somewhere confusing later.
  */
 
+import "zod/compile";
 import * as z from "zod/mini";
 
 /** Protocol version this client was built against. */
