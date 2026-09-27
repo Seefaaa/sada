@@ -76,6 +76,7 @@ jobs:
   windows:
     name: Windows
     runs-on: windows-latest
+    needs: rust
     steps:
       - uses: actions/checkout@v4
 

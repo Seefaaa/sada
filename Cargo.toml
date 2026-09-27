@@ -1,3 +1,5 @@
+cargo-features = ["profile-rustflags"]
+
 [workspace]
 resolver = "3"
 members = [
@@ -47,9 +49,14 @@ missing_docs = "warn"
 missing_docs_in_private_items = "warn"
 
 [profile.release]
+rustflags = ["-C", "target-cpu=native"]
 opt-level = 3
 lto = true
 codegen-units = 1
 debug = true
 strip = "debuginfo"
 split-debuginfo = "off"
+
+[profile.dist]
+inherits = "release"
+rustflags = []

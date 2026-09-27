@@ -3,7 +3,6 @@ build-client = "build -p sada-client --target i686-unknown-linux-gnu"
 build-server = "build -p sada-server"
 
 [build]
-rustflags = ["-C", "target-cpu=native"]
 rustdocflags = ["--document-private-items"]
 
 [env]
