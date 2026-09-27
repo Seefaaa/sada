@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,9 +21,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      web: ${{ steps.filter.outputs.web }}
+      biome: ${{ steps.filter.outputs.biome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - Cargo.lock
+              - rust-toolchain.toml
+              - rustfmt.toml
+              - .cargo/**
+              - sada-byondapi/include/**
+              - .github/workflows/ci.yml
+            web:
+              - sada-web/**
+              - package.json
+              - bun.lock
+              - .github/workflows/ci.yml
+            biome:
+              - '**/*.ts'
+              - '**/*.css'
+              - '**/*.json'
+              - biome.json
+              - bun.lock
+              - .github/workflows/ci.yml
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.biome == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +76,8 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -76,7 +117,8 @@ jobs:
   windows:
     name: Windows
     runs-on: windows-latest
-    needs: rust
+    needs: [changes, rust]
+    if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -97,6 +139,8 @@ jobs:
   web:
     name: Web
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
     defaults:
       run:
         working-directory: sada-web
