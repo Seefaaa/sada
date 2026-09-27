@@ -141,15 +141,10 @@
 		world.log << "OK: session token survives as a string; as a number it would arrive as [as_number["session"]]."
 
 /proc/sada_test_events()
-	var/datum/sada_response/events/response
-	try response = sada_poll_events(32).wait()
-	catch(var/error)
-		world.log << "FAIL: polling events failed: [error]"
-		return
+	var/datum/sada_events/taken = sada_take_events(32)
+	var/list/datum/sada_event/queued = taken?.events
 
-	var/list/datum/sada_event/queued = response.events
-
-	world.log << "Events queued: [length(queued)]"
+	world.log << "Events waiting: [length(queued)]"
 
 	for(var/datum/sada_event/event in queued)
 		world.log << "  [event]"

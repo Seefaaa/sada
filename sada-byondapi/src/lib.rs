@@ -5,7 +5,7 @@
 mod bindings;
 pub mod byond;
 pub mod macros;
-#[cfg(feature = "async")]
+#[cfg(feature = "byond-await")]
 pub mod runtime;
 pub mod sys;
 

@@ -63,7 +63,7 @@ pub fn to_string(value: &CByondValue) -> String {
 ///
 /// Byondapi may only be touched from the main thread, so anything on the async runtime that needs it hands a closure
 /// back through [`Byond_ThreadSync`](crate::sys::Byondapi::Byond_ThreadSync) rather than calling directly.
-#[cfg(feature = "async")]
+#[cfg(feature = "byond-await")]
 pub mod sync {
     use std::{ffi::c_void, future::Future};
 
@@ -110,6 +110,6 @@ pub mod sync {
         CByondValue::NULL
     }
 
-    /// [`super::to_string`], from off the game thread.
+    /// [`byond::to_string`](super::to_string), from off the game thread.
     pub async fn to_string(value: CByondValue) -> String { with_main(move || super::to_string(&value)).await }
 }

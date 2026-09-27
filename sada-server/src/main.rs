@@ -53,14 +53,14 @@ async fn main() -> Result<()> {
 
     let directory = Directory::spawn(&config, worker.clone(), sfu_event_rx, shutdown.clone());
 
-    if let Some(path) = &config.server.control_socket {
-        let path = path.clone();
+    if let Some(endpoint) = &config.server.control_socket {
+        let endpoint = endpoint.clone();
         let directory = directory.clone();
         let shutdown = shutdown.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = control::serve(path, directory, shutdown).await {
-                error!(?err, "control socket stopped");
+            if let Err(err) = control::serve(endpoint, directory, shutdown).await {
+                error!(?err, "control channel stopped");
             }
         });
     }

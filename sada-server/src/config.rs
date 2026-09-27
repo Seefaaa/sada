@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use sada_ipc::Endpoint;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -65,10 +66,10 @@ pub enum RoutingPolicy {
 pub struct ServerConfig {
     /// Socket address the HTTP and WebSocket server listens on.
     pub listen: SocketAddr,
-    /// Unix socket path used by the BYOND bridge control channel.
+    /// Endpoint the BYOND bridge control channel is served on.
     ///
-    /// When absent the control channel is not started.
-    pub control_socket: Option<PathBuf>,
+    /// A unix socket path or a named pipe, whichever the host has. When absent the control channel is not started.
+    pub control_socket: Option<Endpoint>,
 }
 
 /// WebRTC transport configuration.

@@ -8,13 +8,13 @@ pub mod codes;
 pub mod player;
 pub mod routing;
 
-use std::{collections::VecDeque, mem, sync::Arc, time::Duration};
+use std::{mem, sync::Arc, time::Duration};
 
 use rustc_hash::FxHashMap;
 use sada_common::{AuthCode, Ckey, ControlEvent, PlayerId, PlayerPatch, SessionId, Transmit};
 use sada_utils::shutdown::Shutdown;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot},
     time::{MissedTickBehavior, interval},
 };
 
@@ -28,11 +28,8 @@ use crate::{
     sfu::{SfuEvent, WorkerCommand, WorkerHandle},
 };
 
-/// Largest number of queued events held for the game.
-///
-/// The game polls every tick; if it stops polling there is no point growing the queue without bound, so the oldest
-/// events are dropped.
-const MAX_QUEUED_EVENTS: usize = 4096;
+/// How many events a control connection may fall behind by before it starts losing the oldest of them.
+const EVENT_CHANNEL_CAPACITY: usize = 4096;
 
 /// How often codes nobody redeemed are swept out.
 ///
@@ -91,12 +88,10 @@ pub enum DirectoryCommand {
         /// Player to forget.
         player: PlayerId,
     },
-    /// The game is collecting queued events.
-    PollEvents {
-        /// Maximum number to return.
-        max: usize,
+    /// A control connection is asking which sessions are bound, to catch up on what it may have missed.
+    Bindings {
         /// Where to send them.
-        reply: oneshot::Sender<Vec<ControlEvent>>,
+        reply: oneshot::Sender<Vec<(PlayerId, SessionId)>>,
     },
 }
 
@@ -105,6 +100,8 @@ pub enum DirectoryCommand {
 pub struct DirectoryHandle {
     /// Command channel.
     commands: mpsc::Sender<DirectoryCommand>,
+    /// Events for the game, for whoever is serving the control channel to subscribe to.
+    events: broadcast::Sender<ControlEvent>,
 }
 
 impl DirectoryHandle {
@@ -127,15 +124,21 @@ impl DirectoryHandle {
         answer.await.ok().flatten()
     }
 
-    /// Collect queued events for the game.
-    pub async fn poll_events(&self, max: usize) -> Vec<ControlEvent> {
+    /// Every session bound right now.
+    pub async fn bindings(&self) -> Vec<(PlayerId, SessionId)> {
         let (reply, answer) = oneshot::channel();
-        let command = DirectoryCommand::PollEvents { max, reply };
+        let command = DirectoryCommand::Bindings { reply };
         if self.commands.send(command).await.is_err() {
             return Vec::new();
         }
         answer.await.unwrap_or_default()
     }
+
+    /// Follow the events the server produces for the game.
+    ///
+    /// Only what the server produces from here on: a subscriber that arrives late has missed what it missed, which is
+    /// why a fresh control connection asks for [`DirectoryHandle::bindings`] as well.
+    pub fn subscribe(&self) -> broadcast::Receiver<ControlEvent> { self.events.subscribe() }
 }
 
 /// Owns game state and derives routing from it.
@@ -148,8 +151,8 @@ pub struct Directory {
     codes: CodeTable,
     /// Which session each player is bound to.
     bindings: FxHashMap<PlayerId, SessionId>,
-    /// Events waiting for the game to collect them.
-    events: VecDeque<ControlEvent>,
+    /// Where events for the game are published.
+    events: broadcast::Sender<ControlEvent>,
     /// Whether player state has moved since the last snapshot went to the SFU.
     routing_dirty: bool,
     /// Handle used to push routing and transmit changes to the SFU.
@@ -172,6 +175,7 @@ impl Directory {
         shutdown: Shutdown,
     ) -> (Self, DirectoryHandle) {
         let (sender, commands) = mpsc::channel(256);
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         let router: Box<dyn Router> = match policy {
             RoutingPolicy::Broadcast => Box::new(BroadcastRouter),
@@ -186,7 +190,7 @@ impl Directory {
             router,
             codes: CodeTable::new(code_ttl),
             bindings: FxHashMap::default(),
-            events: VecDeque::new(),
+            events: events.clone(),
             routing_dirty: false,
             worker,
             commands,
@@ -194,7 +198,12 @@ impl Directory {
             shutdown,
         };
 
-        (directory, DirectoryHandle { commands: sender })
+        let handle = DirectoryHandle {
+            commands: sender,
+            events,
+        };
+
+        (directory, handle)
     }
 
     /// Run until shutdown.
@@ -288,9 +297,8 @@ impl Directory {
                 self.routing_dirty |= self.players.remove(player);
             },
 
-            DirectoryCommand::PollEvents { max, reply } => {
-                let taken = self.events.drain(..self.events.len().min(max)).collect();
-                let _ = reply.send(taken);
+            DirectoryCommand::Bindings { reply } => {
+                let _ = reply.send(self.bindings.iter().map(|(p, s)| (*p, *s)).collect());
             },
         }
     }
@@ -335,12 +343,8 @@ impl Directory {
         self.worker.send(WorkerCommand::Routing(routing)).await;
     }
 
-    /// Queue an event for the game to collect.
-    fn queue(&mut self, event: ControlEvent) {
-        if self.events.len() >= MAX_QUEUED_EVENTS {
-            self.events.pop_front();
-            warn!("event queue is full, dropping the oldest event");
-        }
-        self.events.push_back(event);
-    }
+    /// Publish an event for the game.
+    ///
+    /// Nobody serving the control channel means nobody to tell, and the event is dropped.
+    fn queue(&self, event: ControlEvent) { let _ = self.events.send(event); }
 }

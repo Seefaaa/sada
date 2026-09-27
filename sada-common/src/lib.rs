@@ -7,11 +7,19 @@
 //! rebuilt alongside the server.
 
 mod control;
-mod frame;
 mod ids;
 
 pub use crate::{
-    control::{ControlEvent, ControlRequest, ControlResponse, Freq, PROTOCOL_VERSION, PlayerPatch, Position, Transmit},
-    frame::{ControlFrameBuffer, Error, MAX_CONTROL_FRAME_LEN, Result},
+    control::{
+        ControlEvent,
+        ControlMessage,
+        ControlRequest,
+        ControlResponse,
+        Freq,
+        PROTOCOL_VERSION,
+        PlayerPatch,
+        Position,
+        Transmit,
+    },
     ids::{AuthCode, Ckey, PlayerId, SessionId},
 };

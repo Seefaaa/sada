@@ -70,11 +70,11 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 /proc/sada_remove_player(player_id)
 	SADA_CALL(remove_player, player_id)
 
-// Asks for up to max queued server events.
-/proc/sada_poll_events(max) as /datum/sada_ticket
-	var/datum/sada_result/result = SADA_CALL(poll_events, max)
-	if(!result.ok) throw result.value
-	return result.value
+// Takes up to max of the events the server has pushed, or null when there are none.
+// Nothing is asked of the server here: events arrive on their own and wait in the
+// client until the game takes them.
+/proc/sada_take_events(max) as /datum/sada_events
+	return SADA_CALL(take_events, max)
 
 
 
@@ -101,13 +101,6 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 /datum/sada_response/session/New(session)
 	src.session = session
 
-/// ControlResponse::Events
-/datum/sada_response/events
-	var/list/events // list of /datum/sada_event
-
-/datum/sada_response/events/New(...)
-	src.events = args.Copy()
-
 /// ControlResponse::Batch
 /datum/sada_response/batch
 	var/list/batch // list of /datum/sada_response
@@ -127,6 +120,13 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 	Event
  */
 
+/// What sada_take_events() hands over
+/datum/sada_events
+	var/list/datum/sada_event/events // list of /datum/sada_event
+
+/datum/sada_events/New(...)
+	src.events = args.Copy()
+
 /// ControlEvent::Authenticated
 /datum/sada_event/authenticated
 	var/player_id // string
@@ -135,6 +135,13 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 /datum/sada_event/authenticated/New(player_id, session)
 	src.player_id = player_id
 	src.session = session
+
+/// ControlEvent::Synchronized
+/datum/sada_event/synchronized
+	var/list/players // list of string
+
+/datum/sada_event/synchronized/New(...)
+	src.players = args.Copy()
 
 /// ControlEvent::Disconnected
 /datum/sada_event/disconnected

@@ -17,8 +17,8 @@
 // Wire protocol this build speaks. The server refuses nothing, so the game checks.
 #define SADA_PROTOCOL_VERSION 1
 
-// How many queued events one poll may drain.
-#define SADA_EVENTS_PER_POLL 64
+// How many of the events waiting in the client one fire may take.
+#define SADA_EVENTS_PER_FIRE 64
 
 // Chance per fire that an untouched player is described again anyway, so a state
 // change nothing marked dirty cannot go unnoticed forever.
@@ -52,9 +52,6 @@ SUBSYSTEM_DEF(sada)
 	var/client_version
 	/// Version the voice server reports.
 	var/server_version
-
-	/// Ticket of the event poll in flight, or 0 when there is none.
-	var/datum/sada_ticket/events_ticket
 
 	/// Players left to describe in this fire, so a long run can resume next tick.
 	var/list/current_run
@@ -152,37 +149,23 @@ SUBSYSTEM_DEF(sada)
 		for(var/mob/living/player in GLOB.player_list)
 			player.sada_invalidate()
 
-/// Keeps exactly one event poll in flight: read the answer to the last one, then ask
-/// again. Latency is one fire, which is what auth and disconnect notices can afford.
+/// Acts on whatever the server has said of its own accord.
+///
+/// The server sends these as they happen and the client holds them until asked.
 /datum/controller/subsystem/sada/proc/collect_events()
-	if(isnull(events_ticket))
-		try events_ticket = sada_poll_events(SADA_EVENTS_PER_POLL)
-		catch(var/error)
-			stack_trace("event poll failed: [error]")
+	var/datum/sada_events/taken = sada_take_events(SADA_EVENTS_PER_FIRE)
+
+	if(isnull(taken))
 		return
 
-	var/raw = sada_poll(events_ticket.ticket)
-
-	if(raw == 1) // pending
-		return
-
-	events_ticket = null
-
-	if(isnull(raw)) // unknown
-		return
-
-	var/datum/sada_response/events/response = raw
-	var/datum/sada_response/error/error = astype(response)
-
-	if(!isnull(error))
-		stack_trace("event poll failed: [error.message]")
-		return
-
-	for(var/datum/sada_event/event as anything in response.events)
+	for(var/datum/sada_event/event as anything in taken.events)
 		handle_event(event)
 
 /datum/controller/subsystem/sada/proc/handle_event(datum/sada_event/event)
 	switch(event.type)
+		if(/datum/sada_event/synchronized)
+			var/datum/sada_event/synchronized/synced = event
+			on_synchronized(synced.players)
 		if(/datum/sada_event/authenticated)
 			var/datum/sada_event/authenticated/auth = event
 			on_authenticated(auth.player_id, auth.session)
@@ -201,10 +184,30 @@ SUBSYSTEM_DEF(sada)
 		if(candidate.sada_id == player_id)
 			return candidate
 
+/// Drops every session the server did not just say it still has.
+///
+/// The server sends this as soon as a control connection is new. A disconnect notice
+/// produced while there was no connection reached nobody, so without this a session the
+/// server has forgotten lives on in the game for the rest of the round: the player stays
+/// "connected", nothing tells them to reconnect, and every push-to-talk addresses a
+/// session that is gone.
+/datum/controller/subsystem/sada/proc/on_synchronized(list/players)
+	for(var/client/candidate as anything in GLOB.clients)
+		if(isnull(candidate.sada_session) || (candidate.sada_id in players))
+			continue
+
+		on_disconnected(candidate.sada_id, candidate.sada_session)
+
 /datum/controller/subsystem/sada/proc/on_authenticated(id, session)
 	var/client/player = client_of(id)
 
 	if(isnull(player))
+		return
+
+	// A fresh control connection is told every live session again, so this is often
+	// something the game already knows; saying so twice would chat at the player and
+	// re-describe their mob for nothing.
+	if(player.sada_session == session)
 		return
 
 	player.sada_session = session

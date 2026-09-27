@@ -1,0 +1,18 @@
+[package]
+name = "sada-ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+flume.workspace = true
+postcard.workspace = true
+sada-utils = { workspace = true, features = ["shutdown"] }
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

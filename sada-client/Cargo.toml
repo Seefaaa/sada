@@ -11,12 +11,13 @@ crate-type = ["cdylib"]
 flume.workspace = true
 sada-byondapi = { workspace = true, features = ["sada"] }
 sada-common = { workspace = true, features = ["byondapi"] }
+sada-ipc.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["full"], optional = true }
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [features]
 default = []
-async = ["sada-byondapi/async", "dep:tokio"]
+byond-await = ["sada-byondapi/byond-await"]
 
 [lints]
 workspace = true

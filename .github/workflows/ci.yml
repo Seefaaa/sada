@@ -45,7 +45,7 @@ jobs:
         with:
           toolchain: nightly-2026-09-26
           components: clippy, rustfmt
-          targets: i686-unknown-linux-gnu
+          targets: i686-unknown-linux-gnu, x86_64-pc-windows-msvc
 
       - name: Install 32-bit linker dependencies
         run: |
@@ -61,11 +61,34 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Run Clippy (Windows target)
+        run: cargo clippy --workspace --exclude sada-server --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+
       - name: Build workspace
         run: cargo build --workspace --locked --all-features
 
       - name: Build client (32-bit)
         run: cargo build -p sada-client --target i686-unknown-linux-gnu --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked --all-features
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-26
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --locked --all-features
 
       - name: Run tests
         run: cargo test --workspace --locked --all-features

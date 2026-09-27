@@ -8,7 +8,7 @@ name = "sada_async"
 crate-type = ["cdylib"]
 
 [dependencies]
-sada-byondapi = { workspace = true, features = ["async"] }
+sada-byondapi = { workspace = true, features = ["byond-await"] }
 
 [lints]
 workspace = true

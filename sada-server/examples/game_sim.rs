@@ -24,7 +24,6 @@ use std::{
     collections::VecDeque,
     env,
     io,
-    os::unix::net::UnixStream,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -40,7 +39,7 @@ use sada_common::{
     AuthCode,
     Ckey,
     ControlEvent,
-    ControlFrameBuffer,
+    ControlMessage,
     ControlRequest,
     ControlResponse,
     Freq,
@@ -50,9 +49,11 @@ use sada_common::{
     SessionId,
     Transmit,
 };
+use sada_ipc::{Endpoint, Receiver, RecvError, Sender};
+use tokio::runtime::Runtime;
 
-/// Socket path used when `SADA_CONTROL_SOCKET` is unset.
-const DEFAULT_SOCKET: &str = "/tmp/sada.sock";
+/// Control endpoint used when `SADA_CONTROL_SOCKET` is unset.
+const DEFAULT_ENDPOINT: &str = "/tmp/sada.sock";
 
 /// How often the simulated game recomputes and pushes state.
 const TICK: Duration = Duration::from_millis(200);
@@ -74,9 +75,6 @@ const MAP_HEIGHT: i32 = 28;
 /// Chebyshev, matching `ProximityRouter`'s default, so the hearer lists this example sends agree with what the server
 /// would compute from positions alone.
 const HEARING_RADIUS: i32 = 7;
-
-/// Largest number of events collected in one poll.
-const EVENTS_PER_POLL: u16 = 64;
 
 /// Number of log lines kept.
 const LOG_CAPACITY: usize = 500;
@@ -129,8 +127,8 @@ const CREW: [(&str, char, i32, i32, usize); 6] = [
 ];
 
 fn main() -> io::Result<()> {
-    let path = env::var("SADA_CONTROL_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_owned());
-    let mut app = App::new(path);
+    let endpoint = env::var("SADA_CONTROL_SOCKET").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned());
+    let mut app = App::new(Endpoint::new(endpoint))?;
 
     ratatui::run(|terminal| {
         while app.running {
@@ -325,83 +323,120 @@ enum Commit {
         /// Intent the server now holds for them.
         talking: Option<Talking>,
     },
-    /// The response carries queued events.
-    Events,
 }
 
-/// A blocking client for the control socket.
+/// A blocking client for the control channel.
 ///
 /// Reconnects lazily, because the simulation is expected to outlive server restarts, that is half of what makes it
-/// useful to leave running.
+/// useful to leave running. The channel's own tasks run on [`Control::runtime`] while the interface stays on this
+/// thread and uses the blocking end of it, which is the same shape the game bridge is in.
 struct Control {
-    /// Path of the socket to connect to.
-    path: String,
-    /// Current connection, absent while disconnected.
-    stream: Option<UnixStream>,
-    /// Reusable framing buffer.
-    buffer: ControlFrameBuffer,
+    /// Endpoint to connect to.
+    endpoint: Endpoint,
+    /// Runtime the channel is driven by.
+    runtime: Runtime,
+    /// Current channel, absent while disconnected.
+    channel: Option<Connection>,
+    /// Events that arrived while something else was being waited for.
+    events: VecDeque<ControlEvent>,
     /// Why the last attempt failed, shown in the status bar.
     error: Option<String>,
     /// Number of requests sent since startup.
     requests: u64,
 }
 
+/// The two ends of one control channel.
+struct Connection {
+    /// Requests out.
+    to_server: Sender<ControlRequest>,
+    /// Answers and events in.
+    from_server: Receiver<ControlMessage>,
+}
+
 impl Control {
-    /// Create a client that will connect to `path` on first use.
-    fn new(path: String) -> Self {
-        Self {
-            path,
-            stream: None,
-            buffer: ControlFrameBuffer::new(),
+    /// Create a client that will connect to `endpoint` on first use.
+    fn new(endpoint: Endpoint) -> io::Result<Self> {
+        Ok(Self {
+            endpoint,
+            runtime: Runtime::new()?,
+            channel: None,
+            events: VecDeque::new(),
             error: None,
             requests: 0,
-        }
+        })
     }
 
     /// Whether a connection is currently established.
-    fn is_connected(&self) -> bool { self.stream.is_some() }
+    fn is_connected(&self) -> bool { self.channel.is_some() }
 
-    /// Send one request and read its response, connecting if needed.
+    /// Send one request and wait for its answer, connecting if needed.
     ///
     /// Any failure drops the connection so the next call reconnects, and is reported through [`Control::error`] rather
-    /// than by returning a value the caller would have to thread through the UI.
-    fn call(&mut self, request: &ControlRequest) -> Option<ControlResponse> {
-        if self.stream.is_none() {
+    /// than by returning a value the caller would have to thread through the UI. Events that overtake the answer are
+    /// kept for [`Control::take_events`], since they are not answers to anything.
+    fn call(&mut self, request: ControlRequest) -> Option<ControlResponse> {
+        if self.channel.is_none() {
             self.connect()?;
         }
 
-        let stream = self.stream.as_mut()?;
+        let channel = self.channel.as_ref()?;
+        let to_server = channel.to_server.clone();
+        let from_server = channel.from_server.clone();
 
         self.requests += 1;
 
-        let outcome = self
-            .buffer
-            .write(stream, request)
-            .and_then(|()| self.buffer.read(stream));
+        if let Err(err) = to_server.send(request) {
+            self.drop_connection(err.to_string());
+            return None;
+        }
 
-        match outcome {
-            Ok(Some(response)) => {
-                self.error = None;
-                Some(response)
-            },
-            Ok(None) => {
-                self.drop_connection("the server closed the connection".to_owned());
-                None
-            },
-            Err(err) => {
-                self.drop_connection(err.to_string());
-                None
-            },
+        let deadline = Instant::now() + CALL_TIMEOUT;
+
+        loop {
+            match from_server.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(ControlMessage::Response(response)) => {
+                    self.error = None;
+                    return Some(response);
+                },
+                Ok(ControlMessage::Events(events)) => self.events.extend(events),
+                Err(err) => {
+                    self.drop_connection(err.to_string());
+                    return None;
+                },
+            }
         }
     }
 
-    /// Open the socket and apply the call timeouts.
+    /// Take everything the server has said of its own accord since the last look.
+    fn take_events(&mut self) -> Vec<ControlEvent> {
+        if let Some(channel) = self.channel.as_ref() {
+            let from_server = channel.from_server.clone();
+
+            loop {
+                match from_server.try_recv() {
+                    Ok(ControlMessage::Events(events)) => self.events.extend(events),
+                    // Nothing is waiting for an answer, so one arriving means the two ends are out of step.
+                    Ok(ControlMessage::Response(_)) => {
+                        self.drop_connection("an answer arrived with no request outstanding".to_owned());
+                        break;
+                    },
+                    Err(RecvError::Empty) => break,
+                    Err(err) => {
+                        self.drop_connection(err.to_string());
+                        break;
+                    },
+                }
+            }
+        }
+
+        self.events.drain(..).collect()
+    }
+
+    /// Open the channel.
     fn connect(&mut self) -> Option<()> {
-        match UnixStream::connect(&self.path) {
-            Ok(stream) => {
-                let _ = stream.set_read_timeout(Some(CALL_TIMEOUT));
-                let _ = stream.set_write_timeout(Some(CALL_TIMEOUT));
-                self.stream = Some(stream);
+        match self.runtime.block_on(sada_ipc::connect(&self.endpoint)) {
+            Ok((to_server, from_server)) => {
+                self.channel = Some(Connection { to_server, from_server });
                 self.error = None;
                 Some(())
             },
@@ -414,7 +449,7 @@ impl Control {
 
     /// Forget the connection and record why.
     fn drop_connection(&mut self, reason: String) {
-        self.stream = None;
+        self.channel = None;
         self.error = Some(reason);
     }
 }
@@ -477,7 +512,7 @@ struct App {
 
 impl App {
     /// Set up a round with the starting crew.
-    fn new(path: String) -> Self {
+    fn new(endpoint: Endpoint) -> io::Result<Self> {
         let players = CREW
             .iter()
             .zip(1..)
@@ -487,8 +522,8 @@ impl App {
             .collect::<Vec<_>>();
         let next_player = players.len() as u32 + 1;
 
-        Self {
-            control: Control::new(path),
+        Ok(Self {
+            control: Control::new(endpoint)?,
             players,
             selected: 0,
             crew_state: ListState::default().with_selected(Some(0)),
@@ -505,7 +540,7 @@ impl App {
                 | 1,
             spawned: 0,
             next_player,
-        }
+        })
     }
 
     /// Block until the next tick is due or a key is pressed.
@@ -550,7 +585,7 @@ impl App {
 
         let (requests, commits) = self.build_requests();
 
-        let Some(response) = self.control.call(&ControlRequest::Batch(requests)) else {
+        let Some(response) = self.control.call(ControlRequest::Batch(requests)) else {
             self.report_connection_error();
             return;
         };
@@ -563,6 +598,10 @@ impl App {
         match response {
             ControlResponse::Batch(responses) => self.apply_batch(responses, commits),
             other => self.log(LogKind::Error, format!("unexpected response to a batch: {other:?}")),
+        }
+
+        for event in self.control.take_events() {
+            self.on_event(event);
         }
     }
 
@@ -648,9 +687,6 @@ impl App {
             });
         }
 
-        requests.push(ControlRequest::PollEvents { max: EVENTS_PER_POLL });
-        commits.push(Commit::Events);
-
         (requests, commits)
     }
 
@@ -673,11 +709,6 @@ impl App {
                     let who = &self.players[player].ckey;
                     self.log(LogKind::Action, format!("{who} {}", describe_talking(talking)));
                 },
-                (ControlResponse::Events(events), Commit::Events) => {
-                    for event in events {
-                        self.on_event(event);
-                    }
-                },
                 (ControlResponse::Error { message }, _) => {
                     self.log(LogKind::Error, message);
                 },
@@ -688,9 +719,29 @@ impl App {
         }
     }
 
-    /// React to one event the server queued for the game.
+    /// React to one event the server sent.
     fn on_event(&mut self, event: ControlEvent) {
         match event {
+            ControlEvent::Synchronized { players } => {
+                // The whole truth about who is bound, so a session this simulation still remembers and the server does
+                // not has to go: the `Disconnected` for it may have been produced while the channel was down.
+                let dropped = self
+                    .players
+                    .iter_mut()
+                    .filter(|player| player.session.is_some() && !players.contains(&player.player_id))
+                    .map(|player| {
+                        player.session = None;
+                        player.sent_talking = None;
+                        player.ckey.clone()
+                    })
+                    .collect::<Vec<_>>();
+
+                self.log(LogKind::Event, format!("server has {} session(s) bound", players.len()));
+
+                for who in dropped {
+                    self.log(LogKind::Event, format!("{who} lost their session while away"));
+                }
+            },
             ControlEvent::Authenticated { player, session } => {
                 let who = self.name_of(player);
                 self.log(LogKind::Event, format!("{who} authenticated as session {session}"));
@@ -740,7 +791,7 @@ impl App {
 
     /// Ask the server what it is, once per connection.
     fn ask_version(&mut self) {
-        match self.control.call(&ControlRequest::Version) {
+        match self.control.call(ControlRequest::Version) {
             Some(ControlResponse::Version { protocol, version }) => {
                 if protocol != sada_common::PROTOCOL_VERSION {
                     self.log(
@@ -956,7 +1007,7 @@ impl App {
             ckey: ckey.clone(),
         };
 
-        match self.control.call(&request) {
+        match self.control.call(request) {
             Some(ControlResponse::Ok) => {
                 self.players[self.selected].code = Some(code.clone());
                 self.log(
@@ -979,7 +1030,7 @@ impl App {
             return;
         };
 
-        match self.control.call(&ControlRequest::CheckAuth { player }) {
+        match self.control.call(ControlRequest::CheckAuth { player }) {
             Some(ControlResponse::Session { session }) => {
                 let answer = session.map_or_else(|| "not authenticated".to_owned(), |id| format!("session {id}"));
                 self.log(LogKind::Action, format!("{ckey}: {answer}"));
@@ -1021,7 +1072,7 @@ impl App {
         self.selected = self.selected.min(self.players.len() - 1);
         self.crew_state.select(Some(self.selected));
 
-        match self.control.call(&ControlRequest::RemovePlayer {
+        match self.control.call(ControlRequest::RemovePlayer {
             player: player.player_id,
         }) {
             Some(ControlResponse::Ok) => self.log(LogKind::Action, format!("{} left the round", player.ckey)),
@@ -1112,7 +1163,7 @@ impl App {
                 self.tick,
                 self.control.requests,
                 self.players.len(),
-                self.control.path,
+                self.control.endpoint,
             )),
         ]);
 

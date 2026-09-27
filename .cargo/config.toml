@@ -4,3 +4,7 @@ build-server = "build -p sada-server"
 
 [build]
 rustflags = ["-C", "target-cpu=native"]
+rustdocflags = ["--document-private-items"]
+
+[env]
+AWS_LC_SYS_PREBUILT_NASM = "1"

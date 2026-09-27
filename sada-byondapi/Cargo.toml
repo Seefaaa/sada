@@ -11,12 +11,12 @@ tokio = { workspace = true, features = ["rt", "sync"], optional = true }
 
 [build-dependencies]
 bindgen = { workspace = true, optional = true }
-doxygen-rs.workspace = true
+doxygen-rs = { workspace = true, optional = true }
 
 [features]
 default = []
-async = ["dep:tokio", "dep:sada-utils"]
-generate-bindings = ["dep:bindgen"]
+byond-await = ["dep:tokio", "dep:sada-utils"]
+generate-bindings = ["dep:bindgen", "dep:doxygen-rs"]
 sada = []
 
 [lints]

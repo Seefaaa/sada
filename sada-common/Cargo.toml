@@ -4,15 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-postcard.workspace = true
 sada-byondapi = { workspace = true, optional = true }
 serde.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true, optional = true, features = ["io-util", "sync"] }
+
+[dev-dependencies]
+postcard.workspace = true
 
 [features]
 default = []
-async = ["dep:tokio"]
 byondapi = ["dep:sada-byondapi"]
 
 [lints]

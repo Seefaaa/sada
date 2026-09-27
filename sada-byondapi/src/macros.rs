@@ -2,7 +2,7 @@
 
 use std::{backtrace::Backtrace, borrow::Cow, cell::RefCell, sync::Once};
 
-#[cfg(feature = "async")]
+#[cfg(feature = "byond-await")]
 use crate::BYONDAPI;
 use crate::sys::CByondValue;
 
@@ -31,13 +31,37 @@ macro_rules! byond_fn {
         })
     }};
 
-    (
-        $(#[$met:meta])*
+    (@doc
+        [$($prefix:ident)?] [$name:ident]
+        [$($first:ident : $first_ty:ty $(, $arg:ident : $arg_ty:ty)*)?]
+        [$($ret:ty)?]
+    ) => {
+        concat!(
+            $(concat!(stringify!($prefix), " "),)? "fn ", stringify!($name), "(", $(
+                stringify!($first), ": ", stringify!($first_ty),
+                $(", ", stringify!($arg), ": ", stringify!($arg_ty),)*
+            )? ")", $(concat!(" -> ", stringify!($ret)))?
+        )
+    };
+
+    (@group [$($doc:tt)*] [$($other:tt)*] #[doc = $d:expr] $($rest:tt)*) => {
+        $crate::byond_fn!(@group [$($doc)* #[doc = $d]] [$($other)*] $($rest)* );
+    };
+
+    (@group [$($doc:tt)*] [$($other:tt)*] #[$($a:tt)*] $($rest:tt)*) => {
+        $crate::byond_fn!(@group [$($doc)*] [$($other)* #[$($a)*]] $($rest)*);
+    };
+
+    (@group
+        [$(#[doc = $doc:expr])*]
+        [$(#[$met:meta])*]
         fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) $(-> $ret:ty)? $body:block
     ) => {
         $crate::paste::paste! {
             #[unsafe(no_mangle)]
             #[allow(missing_docs, clippy::missing_safety_doc)]
+            $(#[doc = $doc])*
+            #[doc = concat!("```ignore\n", $crate::byond_fn!(@doc [] [$name] [$($arg : $arg_ty),*] [$($ret)?]), "\n```")]
             pub extern "C-unwind" fn $name(
                 __argc: u32, __argv: *mut $crate::sys::CByondValue,
             ) -> $crate::sys::CByondValue {
@@ -48,18 +72,22 @@ macro_rules! byond_fn {
                 })
             }
             $(#[$met])*
+            #[doc(hidden)]
             #[inline(always)]
             fn [<__ $name>]($($arg : $arg_ty),*) $(-> $ret)? $body
         }
     };
 
-    (
-        $(#[$met:meta])*
+    (@group
+        [$(#[doc = $doc:expr])*]
+        [$(#[$met:meta])*]
         async fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) $(-> $ret:ty)? $body:block
     ) => {
         $crate::paste::paste! {
             #[unsafe(no_mangle)]
             #[allow(missing_docs, clippy::missing_safety_doc)]
+            $(#[doc = $doc])*
+            #[doc = concat!("```ignore\n", $crate::byond_fn!(@doc [async] [$name] [$($arg : $arg_ty),*] [$($ret)?]), "\n```")]
             pub extern "C-unwind" fn $name(
                 __argc: u32, __argv: *mut $crate::sys::CByondValue, __waiting_proc: $crate::sys::CByondValue,
             ) {
@@ -75,9 +103,19 @@ macro_rules! byond_fn {
                 })
             }
             $(#[$met])*
+            #[doc(hidden)]
             async fn [<__ $name>]($($arg : $arg_ty),*) $(-> $ret)? $body
         }
     };
+
+    (@group [$($doc:tt)*] [$($other:tt)*] $($rest:tt)*) => {
+        compile_error!(concat!(
+            "byond_fn takes `fn name(arg: Ty, ..) -> Ty { .. }` and optionally async, but got: ",
+            stringify!($($rest)*)
+        ));
+    };
+
+    ($($tt:tt)*) => { $crate::byond_fn!(@group [] [] $($tt)*); };
 
     attr() ($($tt:tt)*) => { $crate::byond_fn!($($tt)*); };
 }
@@ -155,7 +193,7 @@ pub fn __panic_msg() -> String {
 }
 
 #[doc(hidden)]
-#[cfg(feature = "async")]
+#[cfg(feature = "byond-await")]
 /// Callback for [`Byond_ThreadSync`](crate::sys::Byondapi::Byond_ThreadSync) in [`byond_fn`] macro to return async
 /// results to BYOND's thread.
 pub extern "C-unwind" fn __return<R>(data: *mut std::ffi::c_void) -> CByondValue
@@ -168,6 +206,6 @@ where
 }
 
 #[doc(hidden)]
-#[cfg(feature = "async")]
+#[cfg(feature = "byond-await")]
 /// Assert that the type is [`Send`], so the async we can move it from/to BYOND's thread.
 pub fn __must_send<T: Send>() {}

@@ -5,6 +5,7 @@ members = [
     "sada-client",
     "sada-client-async",
     "sada-common",
+    "sada-ipc",
     "sada-server",
     "sada-utils",
 ]
@@ -27,6 +28,7 @@ postcard = { version = "1", features = ["use-std"] }
 rustc-hash = "2.1"
 sada-common = { path = "sada-common" }
 sada-byondapi = { path = "sada-byondapi" }
+sada-ipc = { path = "sada-ipc" }
 sada-utils = { path = "sada-utils" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

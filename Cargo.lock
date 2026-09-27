@@ -2035,6 +2035,7 @@ dependencies = [
  "flume",
  "sada-byondapi",
  "sada-common",
+ "sada-ipc",
  "serde",
  "tokio",
 ]
@@ -2053,6 +2054,16 @@ dependencies = [
  "postcard",
  "sada-byondapi",
  "serde",
+]
+
+[[package]]
+name = "sada-ipc"
+version = "0.1.0"
+dependencies = [
+ "flume",
+ "postcard",
+ "sada-utils",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -2068,6 +2079,7 @@ dependencies = [
  "ratatui",
  "rustc-hash",
  "sada-common",
+ "sada-ipc",
  "sada-utils",
  "serde",
  "serde_json",

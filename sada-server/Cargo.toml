@@ -9,7 +9,8 @@ futures-util.workspace = true
 hound = { workspace = true, optional = true }
 opus = { workspace = true, optional = true }
 rustc-hash.workspace = true
-sada-common = { workspace = true, features = ["async"] }
+sada-common.workspace = true
+sada-ipc.workspace = true
 sada-utils = { workspace = true, features = ["shutdown"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -1,6 +1,5 @@
 //! A bridge library between game server and VC server.
 
-#![cfg(target_os = "linux")]
 #![feature(macro_attr, const_trait_impl, const_convert)]
 
 mod control;
@@ -9,7 +8,7 @@ mod player;
 use std::num::NonZeroU16;
 
 use sada_byondapi::{byond, byond_fn, sys::CByondValue};
-use sada_common::{PlayerId, PlayerPatch, SessionId};
+use sada_common::{ControlEvent, PlayerId, PlayerPatch, SessionId};
 
 use crate::control::Poll;
 
@@ -18,6 +17,21 @@ struct Ticket(NonZeroU16);
 
 impl From<Ticket> for CByondValue {
     fn from(value: Ticket) -> Self { byond::new(c"/datum/sada_ticket", &[CByondValue::from(value.0.get())]) }
+}
+
+/// Events on their way to DM, which sees them as a `/datum/sada_events`.
+struct Events(Vec<ControlEvent>);
+
+impl From<Events> for CByondValue {
+    fn from(value: Events) -> Self {
+        let events = value.0.into_iter().map(CByondValue::from).collect::<Vec<_>>();
+
+        let value = byond::new(c"/datum/sada_events", &events);
+
+        events.into_iter().for_each(|e| byond::value_decref(&e));
+
+        value
+    }
 }
 
 /// Returns the version of this library.
@@ -109,12 +123,17 @@ fn flush() { control::flush() }
 #[byond_fn]
 fn remove_player(player: String) { control::remove_player(&player) }
 
-/// Asks for up to `max` queued server events. Returns the ticket they arrive under.
+/// Takes up to `max` of the events the server has pushed, or null when there are none.
+///
+/// Nothing is asked of the server here: events arrive on their own and wait in the client until the game takes them.
 #[byond_fn]
-fn poll_events(max: u16) -> Result<Ticket, String> { control::poll_events(max).map(Ticket) }
+fn take_events(max: u16) -> Option<Events> {
+    let events = control::take_events(max);
+    (!events.is_empty()).then_some(Events(events))
+}
 
 /// Sleeps a second off the game thread and answers afterwards, to exercise the async export shape.
-#[cfg(feature = "async")]
+#[cfg(feature = "byond-await")]
 #[byond_fn]
 async fn async_test() -> CByondValue {
     use std::time::Duration;

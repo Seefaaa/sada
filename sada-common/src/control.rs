@@ -1,8 +1,9 @@
 //! Control protocol spoken between the BYOND game server and the voice server.
 //!
-//! The game drives this channel: it opens the socket, sends a request and reads exactly one response. That shape is
-//! forced by BYOND, whose `call_ext` blocks the game thread, so the server can never push unsolicited frames. Anything
-//! the server needs to tell the game is queued and collected with [`ControlRequest::PollEvents`].
+//! The game asks and the server answers, one [`ControlResponse`] per [`ControlRequest`] and in the same order, which is
+//! what lets the game match an answer to a request without either side numbering them. Alongside those answers the
+//! server says whatever it has to say of its own accord, as [`ControlMessage::Events`]; the two are separate enough
+//! that an event can arrive in the middle of a batch being answered.
 //!
 //! Two consequences shaped the design:
 //!
@@ -312,11 +313,6 @@ pub enum ControlRequest {
     /// Nested batches are rejected; the server answers with
     /// [`ControlResponse::Batch`] holding one response per element, in order.
     Batch(Vec<ControlRequest>),
-    /// Collect queued server-to-game events.
-    PollEvents {
-        /// Maximum number of events to return.
-        max: u16,
-    },
 }
 
 /// A response returned by the voice server's control socket.
@@ -337,8 +333,6 @@ pub enum ControlResponse {
         /// Bound session, or `None` when the player has not authenticated.
         session: Option<SessionId>,
     },
-    /// Events queued since the last poll.
-    Events(Vec<ControlEvent>),
     /// One response per element of a [`ControlRequest::Batch`].
     Batch(Vec<ControlResponse>),
     /// The request could not be applied.
@@ -375,15 +369,6 @@ impl From<ControlResponse> for sada_byondapi::sys::CByondValue {
 
                 value
             },
-            ControlResponse::Events(events) => {
-                let events = events.into_iter().map(Into::into).collect::<Vec<_>>();
-
-                let value = byond::new(c"/datum/sada_response/events", &events);
-
-                events.into_iter().for_each(|e| byond::value_decref(&e));
-
-                value
-            },
             ControlResponse::Batch(responses) => {
                 let responses = responses.into_iter().map(Into::into).collect::<Vec<_>>();
 
@@ -406,10 +391,22 @@ impl From<ControlResponse> for sada_byondapi::sys::CByondValue {
     }
 }
 
+/// Anything the server says on the control channel.
+///
+/// Responses arrive one per request and in order, which is all the game needs to match them up; events arrive whenever
+/// the server has some, so the game skips over them while doing that matching.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlMessage {
+    /// The answer to the oldest request the server has not answered yet.
+    Response(ControlResponse),
+    /// Events the server has produced since the last frame of them.
+    Events(Vec<ControlEvent>),
+}
+
 /// Something the server needs to tell the game about.
 ///
-/// Queued server-side and drained by [`ControlRequest::PollEvents`], because the control socket cannot carry
-/// unsolicited frames.
+/// Sent as the server produces it rather than when the game asks, and in batches rather than one event per frame.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlEvent {
@@ -419,6 +416,14 @@ pub enum ControlEvent {
         player: PlayerId,
         /// Session now bound to them.
         session: SessionId,
+    },
+    /// Every player the server has a session for, sent as soon as a control connection is new.
+    ///
+    /// Full state rather than an edge, like [`ControlEvent::Speaking`]: a session the game remembers and this does not
+    /// name is gone, whether or not the game ever heard the [`ControlEvent::Disconnected`] for it.
+    Synchronized {
+        /// Players with a bound session right now.
+        players: Vec<PlayerId>,
     },
     /// A bound session went away.
     Disconnected {
@@ -459,7 +464,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
 
         match value {
             ControlEvent::Authenticated { player, session } => {
-                let player = CByondValue::from(player.to_string());
+                let player = CByondValue::from(player.token());
                 let session = CByondValue::from(session.token());
 
                 let value = byond::new(c"/datum/sada_event/authenticated", &[player, session]);
@@ -469,8 +474,17 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
 
                 value
             },
+            ControlEvent::Synchronized { players } => {
+                let args = Vec::from_iter(players.into_iter().map(|p| CByondValue::from(p.token())));
+
+                let value = byond::new(c"/datum/sada_event/synchronized", &args);
+
+                args.into_iter().for_each(|a| byond::value_decref(&a));
+
+                value
+            },
             ControlEvent::Disconnected { player, session } => {
-                let player = CByondValue::from(player.to_string());
+                let player = CByondValue::from(player.token());
                 let session = CByondValue::from(session.token());
 
                 let value = byond::new(c"/datum/sada_event/disconnected", &[player, session]);
@@ -482,8 +496,8 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
             },
             ControlEvent::Speaking { speaker, listeners } => {
                 let args = Vec::from_iter(
-                    iter::once(CByondValue::from(speaker.to_string()))
-                        .chain(listeners.into_iter().map(|p| CByondValue::from(p.to_string()))),
+                    iter::once(CByondValue::from(speaker.token()))
+                        .chain(listeners.into_iter().map(|p| CByondValue::from(p.token()))),
                 );
 
                 let value = byond::new(c"/datum/sada_event/speaking", &args);
@@ -498,8 +512,8 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
                 channel,
                 language,
             } => {
-                let speaker = CByondValue::from(speaker.to_string());
-                let listener = CByondValue::from(listener.to_string());
+                let speaker = CByondValue::from(speaker.token());
+                let listener = CByondValue::from(listener.token());
                 let channel = channel.map(|f| CByondValue::from(f.0)).unwrap_or(CByondValue::NULL);
                 let language = language.map(CByondValue::from).unwrap_or(CByondValue::NULL);
 
@@ -517,7 +531,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlEvent, ControlRequest, ControlResponse, Freq, PlayerPatch, Position, Transmit};
+    use super::{ControlEvent, ControlMessage, ControlRequest, ControlResponse, Freq, PlayerPatch, Position, Transmit};
     use crate::ids::{PlayerId, SessionId};
 
     /// Encode and decode a value through the wire format.
@@ -617,8 +631,24 @@ mod tests {
     }
 
     #[test]
+    fn a_message_distinguishes_an_answer_from_events() {
+        let response = ControlMessage::Response(ControlResponse::Ok);
+        let events = ControlMessage::Events(vec![ControlEvent::Disconnected {
+            player: PlayerId::from_raw(1),
+            session: SessionId::new(1, 1),
+        }]);
+
+        assert_ne!(response, events);
+        assert_eq!(round_trip(&response), response);
+        assert_eq!(round_trip(&events), events);
+    }
+
+    #[test]
     fn events_round_trip() {
         for event in [
+            ControlEvent::Synchronized {
+                players: vec![PlayerId::from_raw(1), PlayerId::from_raw(2)],
+            },
             ControlEvent::Authenticated {
                 player: PlayerId::from_raw(1),
                 session: SessionId::new(1, 1),
