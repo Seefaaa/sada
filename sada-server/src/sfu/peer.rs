@@ -17,7 +17,7 @@ use str0m::{
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-#[cfg(feature = "audio_dump")]
+#[cfg(all(unix, feature = "audio_dump"))]
 use crate::audio::AudioSink;
 use crate::{
     proto::{AudibleSpeaker, Offset, ServerMessage, ServerOrderedMessage, ServerUnorderedMessage},
@@ -161,7 +161,7 @@ pub struct Peer {
     ///
     /// Created once the session id is known, which is only after the peer has
     /// been stored.
-    #[cfg(feature = "audio_dump")]
+    #[cfg(all(unix, feature = "audio_dump"))]
     sink: Option<AudioSink>,
     /// The browser's data channels.
     channels: Channels,
@@ -185,7 +185,7 @@ impl Peer {
             timelines: HashMap::new(),
             negotiation: None,
             wants_slots: false,
-            #[cfg(feature = "audio_dump")]
+            #[cfg(all(unix, feature = "audio_dump"))]
             sink: None,
             channels: Channels::default(),
             positions: PositionState::default(),
@@ -438,11 +438,11 @@ impl Peer {
     }
 
     /// Start capturing this peer's incoming audio to a file.
-    #[cfg(feature = "audio_dump")]
+    #[cfg(all(unix, feature = "audio_dump"))]
     pub fn enable_capture(&mut self, session: SessionId) { self.sink = Some(AudioSink::new(session)); }
 
     /// Record a frame this peer sent, for debugging.
-    #[cfg(feature = "audio_dump")]
+    #[cfg(all(unix, feature = "audio_dump"))]
     pub fn capture(&mut self, data: &MediaData) {
         if let Some(sink) = &mut self.sink {
             sink.handle_frame(data);

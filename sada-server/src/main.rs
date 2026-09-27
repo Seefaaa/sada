@@ -12,7 +12,7 @@
 #[macro_use]
 extern crate tracing;
 
-#[cfg(feature = "audio_dump")]
+#[cfg(all(unix, feature = "audio_dump"))]
 mod audio;
 mod config;
 mod control;

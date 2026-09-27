@@ -378,7 +378,7 @@ impl Worker {
             self.by_player.insert(player, session);
         }
 
-        #[cfg(feature = "audio_dump")]
+        #[cfg(all(unix, feature = "audio_dump"))]
         if let Some(peer) = self.peers.get_mut(session) {
             peer.enable_capture(session);
         }
@@ -559,7 +559,7 @@ impl Worker {
             Event::IceConnectionStateChange(state) => debug!(%session, ?state, "ICE state changed"),
             Event::MediaAdded(added) => peer.on_media_added(added.mid, added.kind, added.direction),
             Event::MediaData(data) => {
-                #[cfg(feature = "audio_dump")]
+                #[cfg(all(unix, feature = "audio_dump"))]
                 peer.capture(&data);
                 self.relay(session, peer, &data, now);
             },
