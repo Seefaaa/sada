@@ -37,6 +37,7 @@
 /client/proc/sada_get_player_id()
 	if(isnull(sada_id))
 		sada_id = sada_player_id(ckey) || ""
+		SSsada.id_to_client[sada_id] = src
 		if(!sada_id)
 			stack_trace("sada could not issue a player id for [ckey], voice chat stays off for them")
 	return sada_id
@@ -165,6 +166,8 @@
 
 	if(SSsada.can_fire && sada_id)
 		sada_remove_player(sada_id)
+
+	SSsada.id_to_client -= sada_id
 
 	return ..()
 

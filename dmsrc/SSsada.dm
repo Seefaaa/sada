@@ -58,6 +58,9 @@ SUBSYSTEM_DEF(sada)
 	/// Every code minted this round, so one is never handed out twice.
 	var/list/used_codes = list()
 
+	/// Maps the voice server's player id to the client that owns it
+	var/alist/id_to_client = list()
+
 /*
 	Startup and shutdown
 */
@@ -177,13 +180,8 @@ SUBSYSTEM_DEF(sada)
 			stack_trace("unknown event type [event.type]")
 
 /// The client the voice server knows by this player id, or null.
-///
-/// A scan rather than a lookup table: it only runs for authentication and disconnect
-/// notices, and a table would be one more thing to keep in step with clients leaving.
-/datum/controller/subsystem/sada/proc/client_of(player_id)
-	for(var/client/candidate as anything in GLOB.clients)
-		if(candidate.sada_id == player_id)
-			return candidate
+/datum/controller/subsystem/sada/proc/client_of(player_id) as /client
+	return id_to_client[player_id]
 
 /// Drops every session the server did not just say it still has.
 ///
