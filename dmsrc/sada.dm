@@ -1,32 +1,21 @@
-// Nothing below waits on the voice server. Calls that carry a result hand back a
-// ticket and the answer is collected on a later tick, because call_ext runs on
-// BYOND's only thread and a stalled server would stall the world.
+// Nothing below stalls the world on the voice server. Calls that carry an answer
+// sleep the proc that made them until it arrives, the way sleep() does, while the
+// library waits for the server off BYOND's thread; everything else returns at once.
 
 var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.so")
 
 #define SADA_CALL(func, args...) (call_ext(SADA, "byond:[#func]")(##args))
-
-// How wait() gives the world a turn between polls. A codebase that has stoplag()
-// should define this as stoplag() before including this file.
-#ifndef SADA_YIELD
-#define SADA_YIELD sleep(world.tick_lag)
-#endif
+#define SADA_AWAIT(func, args...) (call_ext(SADA, "byond,await:[#func]")(##args))
 
 /proc/sada_get_version() as text
 	return SADA_CALL(get_version)
 
-// Starts the control worker. Resolves to a /datum/sada_response/{version,error} or throws an error
-/proc/sada_init(path) as /datum/sada_ticket
-	var/datum/sada_result/result = SADA_CALL(init, path)
-	if(!result.ok) throw result.value
-	return result.value
+// Starts the control worker and returns the server's version. Sleeps; throws on failure.
+/proc/sada_init(path) as /datum/sada_response/version
+	return sada_unwrap(SADA_AWAIT(init, path), /datum/sada_response/version)
 
 /proc/sada_stop()
 	SADA_CALL(stop)
-
-// Returns null if the ticket is unknown, 1 if it is pending, or a /datum/sada_response otherwise
-/proc/sada_poll(ticket) as /datum/sada_response
-	return SADA_CALL(poll_ticket, ticket)
 
 /proc/sada_take_error() as text|null
 	return SADA_CALL(take_error)
@@ -35,17 +24,13 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 /proc/sada_player_id(ckey) as text|null
 	return SADA_CALL(player_id, ckey)
 
-// Ticket resolves ControlResponse::Ok or ControlResponse::Error
-/proc/sada_register_code(code, player_id, ckey) as /datum/sada_ticket
-	var/datum/sada_result/result = SADA_CALL(register_code, code, player_id, ckey)
-	if(!result.ok) throw result.value
-	return result.value
+// Registers an auth code for the player. Sleeps; throws on failure.
+/proc/sada_register_code(code, player_id, ckey) as /datum/sada_response/ok
+	return sada_unwrap(SADA_AWAIT(register_code, code, player_id, ckey), /datum/sada_response/ok)
 
-// Ticket resolves ControlResponse::Session or ControlResponse::Error
-/proc/sada_check_auth(player_id) as /datum/sada_ticket
-	var/datum/sada_result/result = SADA_CALL(check_auth, player_id)
-	if(!result.ok) throw result.value
-	return result.value
+// Returns the session bound to the player. Sleeps; throws on failure.
+/proc/sada_check_auth(player_id) as /datum/sada_response/session
+	return sada_unwrap(SADA_AWAIT(check_auth, player_id), /datum/sada_response/session)
 
 // Fire and forget: returns before the request reaches the socket. A hot microphone
 // cannot wait for a round trip.
@@ -176,35 +161,14 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 
 
 /*
-	Ticket
+	Awaiting
  */
 
-/datum/sada_ticket
-	var/ticket = 0 // number >0
-
-/datum/sada_ticket/New(ticket)
-	src.ticket = ticket
-
-/datum/sada_ticket/proc/wait() as /datum/sada_response
-	var/raw = sada_poll(ticket)
-	while(raw == 1) // pending
-		SADA_YIELD
-		raw = sada_poll(ticket)
-	var/datum/sada_response/error/error = astype(raw)
+/// Hands back a response of the expected type, and throws for anything else: the message of an error response,
+/// or the text the library answers with when it panicked.
+/proc/sada_unwrap(response, expected) as /datum/sada_response
+	if(istext(response)) throw response
+	var/datum/sada_response/error/error = astype(response)
 	if(!isnull(error)) throw error.message
-	// An unknown ticket: stopped, restarted, or evicted while this was waiting on it. Throwing keeps
-	// every caller from reading a field off null.
-	if(isnull(raw)) throw "the request was dropped before the server answered it"
-	return raw
-
-/*
-	Result
- */
-
-/datum/sada_result
-	var/ok // boolean
-	var/value // any
-
-/datum/sada_result/New(ok, value)
-	src.ok = ok
-	src.value = value
+	if(!istype(response, expected)) throw "expected [expected] from the voice chat library, got [response || "nothing"]"
+	return response

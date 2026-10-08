@@ -1,38 +1,12 @@
 //! A bridge library between game server and VC server.
 
-#![feature(macro_attr, const_trait_impl, const_convert)]
+#![feature(macro_attr)]
 
 mod control;
 mod player;
 
-use std::num::NonZeroU16;
-
 use sada_byondapi::{byond, byond_fn, sys::CByondValue};
-use sada_common::{ControlEvent, PlayerId, PlayerPatch, SessionId};
-
-use crate::control::Poll;
-
-/// A ticket on its way to DM, which sees it as a `/datum/sada_ticket`.
-struct Ticket(NonZeroU16);
-
-impl From<Ticket> for CByondValue {
-    fn from(value: Ticket) -> Self { byond::new(c"/datum/sada_ticket", &[CByondValue::from(value.0.get())]) }
-}
-
-/// Events on their way to DM, which sees them as a `/datum/sada_events`.
-struct Events(Vec<ControlEvent>);
-
-impl From<Events> for CByondValue {
-    fn from(value: Events) -> Self {
-        let events = value.0.into_iter().map(CByondValue::from).collect::<Vec<_>>();
-
-        let value = byond::new(c"/datum/sada_events", &events);
-
-        events.into_iter().for_each(|e| byond::value_decref(&e));
-
-        value
-    }
-}
+use sada_common::{ControlEvent, ControlResponse, PlayerId, PlayerPatch, SessionId};
 
 /// Returns the version of this library.
 #[byond_fn]
@@ -40,33 +14,20 @@ fn get_version() -> String { env!("CARGO_PKG_VERSION").to_string() }
 
 /// Starts the control worker and asks the server for its version.
 ///
-/// Returns the ticket that version answer arrives under, or `0` if the worker could not be started. Nothing here
-/// touches the socket, so a server that is not up yet shows as an error on that ticket.
+/// Answers with the server's version, or with an error when the worker could not be started or the server could not
+/// be reached. The worker is installed before the calling proc goes to sleep. One already running is stopped as by
+/// `stop`, and the new one starts only once the old one has finished.
 #[byond_fn]
-fn init(path: String) -> Result<Ticket, String> { control::init(&path).map(Ticket) }
+fn init(path: String) -> impl Future<Output = ControlResponse> { control::init(&path) }
 
-/// Stops the control worker and forgets every outstanding ticket.
+/// Stops the control worker.
+///
+/// A request already on its way is still answered. One still queued is dropped unsent and its waiting proc answered
+/// with an error.
 #[byond_fn]
 fn stop() { control::stop() }
 
-/// Collects the response for a ticket.
-///
-/// Returns `pending` while the request is still with the worker, `unknown` for a ticket that was never issued or has
-/// already been collected, and the JSON-encoded response otherwise.
-#[byond_fn]
-fn poll_ticket(ticket: u16) -> CByondValue {
-    let Some(ticket) = NonZeroU16::new(ticket) else {
-        return CByondValue::NULL;
-    };
-
-    match control::poll(ticket) {
-        Poll::Ready(response) => response.into(),
-        Poll::Pending => const { 1u16.into() },
-        Poll::Unknown => CByondValue::NULL,
-    }
-}
-
-/// Takes the oldest error no ticket was waiting for, or null when there is none.
+/// Takes the oldest error nobody was waiting for, or null when there is none.
 #[byond_fn]
 fn take_error() -> Option<String> { control::take_error() }
 
@@ -76,13 +37,13 @@ fn player_id(ckey: String) -> Option<String> { player::issue(&ckey).map(PlayerId
 
 /// Registers an authentication code for `player`, greeting the browser that redeems it as `ckey`.
 #[byond_fn]
-fn register_code(code: String, player: String, ckey: String) -> Result<Ticket, String> {
-    control::register_code(&code, &player, &ckey).map(Ticket)
+fn register_code(code: String, player: String, ckey: String) -> impl Future<Output = ControlResponse> {
+    control::register_code(&code, &player, &ckey)
 }
 
 /// Looks up the session bound to `player`.
 #[byond_fn]
-fn check_auth(player: String) -> Result<Ticket, String> { control::check_auth(&player).map(Ticket) }
+fn check_auth(player: String) -> impl Future<Output = ControlResponse> { control::check_auth(&player) }
 
 /// Starts transmitting. An empty `freq` means local speech.
 #[byond_fn]
@@ -132,23 +93,14 @@ fn take_events(max: u16) -> Option<Events> {
     (!events.is_empty()).then_some(Events(events))
 }
 
-/// Sleeps a second off the game thread and answers afterwards, to exercise the async export shape.
-#[cfg(feature = "byond-await")]
-#[byond_fn]
-async fn async_test() -> CByondValue {
-    use std::time::Duration;
+/// Events on their way to DM, which sees them as a `/datum/sada_events`.
+struct Events(Vec<ControlEvent>);
 
-    use tokio::time::sleep;
-
-    println!("async test 1");
-
-    sleep(Duration::from_secs(1)).await;
-
-    println!("async test 2");
-
-    let ret = byond::sync::with_main(|| CByondValue::from("async test done".to_string())).await;
-
-    println!("async test 3");
-
-    ret
+impl From<Events> for CByondValue {
+    fn from(value: Events) -> Self {
+        let events = value.0.into_iter().map(CByondValue::from).collect::<Vec<_>>();
+        let value = byond::new(c"/datum/sada_events", &events);
+        events.iter().for_each(byond::value_decref);
+        value
+    }
 }

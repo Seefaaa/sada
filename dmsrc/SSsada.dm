@@ -3,14 +3,13 @@
 // Local speech only. The protocol carries radio too, but nothing here fills in
 // hot_freqs or hear_freqs, so the voice server never routes a radio channel.
 //
-// Nothing in this file waits on the voice server. Calls that carry an answer hand
-// back a ticket and fire() collects it on a later tick, because call_ext runs on
-// BYOND's only thread; see dmsrc/sada.dm for the bindings.
+// Nothing in this file stalls the world on the voice server. The few calls that
+// carry an answer sleep the proc that made them until it arrives, and fire() only
+// ever makes calls that return at once; see dmsrc/sada.dm for the bindings.
 //
 // Install: include this file from the codebase (it pulls in sada_integration.dm
 // itself), include dmsrc/sada.dm somewhere earlier for the bindings, and point the
-// sada_control_socket config entry at the server's control socket. A codebase with
-// stoplag() should also define SADA_YIELD as stoplag() before the bindings.
+// sada_control_socket config entry at the server's control socket.
 
 #include "sada_integration.dm"
 
@@ -76,7 +75,9 @@ SUBSYSTEM_DEF(sada)
 	client_version = sada_get_version()
 
 	var/datum/sada_response/version/response
-	try response = sada_init(control_socket).wait()
+
+	try
+		response = sada_init(control_socket)
 	catch(var/error)
 		stack_trace("could not initialize the voice server: [error]")
 		return SS_INIT_FAILURE
@@ -263,12 +264,13 @@ SUBSYSTEM_DEF(sada)
 	do code = random_auth_code()
 	while (code in used_codes)
 
-	try sada_register_code(code, id, player.ckey).wait()
+	used_codes += code
+
+	try
+		sada_register_code(code, id, player.ckey)
 	catch(var/error)
 		stack_trace("could not register an auth code for [key_name(player)]: [error]")
 		return
-
-	used_codes += code
 
 	return code
 

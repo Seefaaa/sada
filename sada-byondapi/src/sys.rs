@@ -131,28 +131,6 @@ where
     fn from(value: Option<T>) -> Self { value.map(Into::into).unwrap_or(Self::NULL) }
 }
 
-#[cfg(feature = "sada")]
-impl<T, E> From<Result<T, E>> for CByondValue
-where
-    T: Into<CByondValue>,
-    E: Into<CByondValue>,
-{
-    fn from(value: Result<T, E>) -> Self {
-        use crate::byond;
-
-        let (ok, payload) = match value {
-            Ok(ok) => (true, ok.into()),
-            Err(err) => (false, err.into()),
-        };
-
-        let value = byond::new(c"/datum/sada_result", &[CByondValue::from(ok), payload]);
-
-        byond::value_decref(&payload);
-
-        value
-    }
-}
-
 thread_local! {
     static LAST_CRASH: RefCell<String> = const { RefCell::new(String::new()) };
 }

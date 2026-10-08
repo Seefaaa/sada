@@ -1,16 +1,28 @@
 //! Control channel client used by the exported functions.
 //!
-//! `call_ext` runs on BYOND's only thread, so nothing here may wait on the channel: a stalled voice server would stall
-//! the whole world. A worker thread owns the connection, and a tokio runtime of its own, and performs every syscall;
-//! the game thread only hands it jobs and collects whatever has finished. Requests whose answer the game wants are
-//! issued a [`Ticket`] and polled for on a later tick.
+//! `call_ext` runs on BYOND's only thread, so nothing on that thread may wait on the channel: a stalled voice server
+//! would stall the whole world. A worker thread owns the connection, and a tokio runtime of its own, and performs every
+//! syscall; the game thread only hands it jobs and collects whatever has finished. A request whose answer the game
+//! wants is queued on the game thread like any other, in order with everything around it, and the export hands back
+//! a future for its answer, which the runtime waits on while the calling proc sleeps.
 //!
 //! The protocol is strictly one response per request and the server answers in order on a single connection, so the
 //! worker needs no request ids on the wire: the response it is reading belongs to the job it just wrote. Events are the
 //! exception, arriving whenever the server has some, and are queued for the game to take rather than answering
 //! anything.
 
-use std::{cell::RefCell, collections::VecDeque, error::Error, mem, num::NonZeroU16, thread, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    error::Error,
+    mem,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use sada_common::{
     AuthCode,
@@ -26,15 +38,15 @@ use sada_common::{
     Transmit,
 };
 use sada_ipc::{Endpoint, Receiver, RecvError, SendError, Sender};
-use tokio::{runtime, time::timeout};
+use tokio::{runtime, sync::oneshot, time::timeout};
 
 use crate::player;
 
 /// How many jobs may be queued for the worker before the game is told to back off.
 const JOB_QUEUE_DEPTH: usize = 256;
 
-/// How many uncollected replies are kept before the oldest are dropped.
-const MAX_READY_REPLIES: usize = 256;
+/// How many failures nobody is waiting for are kept before the oldest are dropped.
+const MAX_QUEUED_ERRORS: usize = 256;
 
 /// How many pushed events are kept before the oldest are dropped.
 ///
@@ -50,135 +62,158 @@ const MAX_PENDING_REQUESTS: usize = 4096;
 /// How long the worker waits on a wedged server before dropping the connection and reconnecting.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// First ticket handed out, and the one numbering wraps back to.
-const FIRST_TICKET: NonZeroU16 = NonZeroU16::new(1).unwrap();
-
-/// Identifies a deferred response.
-pub type Ticket = NonZeroU16;
+/// How long a request somebody waits on may wait for the worker to start on it before it is dropped unsent.
+const ANSWER_TIMEOUT: Duration = IO_TIMEOUT.saturating_mul(3);
 
 thread_local! {
     /// Game-thread half of the control client, installed by [`init`].
-    static CONTROL: RefCell<Option<ControlState>> = const { RefCell::new(None) };
-}
+    static CONTROL: RefCell<Option<Client>> = const { RefCell::new(None) };
 
-/// State of one deferred response.
-pub enum Poll {
-    /// The response has arrived.
-    Ready(ControlResponse),
-    /// The request is still with the worker.
-    Pending,
-    /// No such ticket: never issued, already collected, or dropped as stale.
-    Unknown,
+    /// Thread of the last worker [`init`] started, which the next one waits out before it starts.
+    static LAST_WORKER: RefCell<Option<thread::JoinHandle<()>>> = const { RefCell::new(None) };
 }
 
 /// One request queued for the worker.
 struct Job {
-    /// Ticket to answer under, or `None` when the game does not want the response.
-    ticket: Option<Ticket>,
     /// Request to send.
     request: ControlRequest,
+    /// Whoever waits for its answer, or `None` when nobody does.
+    waiter: Option<Waiter>,
 }
 
-/// Something the worker finished, for the game thread to collect.
+/// The worker's end of a request somebody waits on.
+struct Waiter {
+    /// Where the answer goes.
+    answer: oneshot::Sender<ControlResponse>,
+    /// Taken by whichever side gets to the request first: the worker sending it, or its caller giving up on it.
+    claim: Arc<AtomicBool>,
+}
+
+/// Something the worker has for the game thread that no waiting request asked for.
 enum Reply {
-    /// A response, under the ticket it answers when the game wanted one.
-    Answer(Option<Ticket>, ControlResponse),
+    /// A failure nobody is waiting for: a fire-and-forget request that failed, or the connection going away.
+    Failure(String),
     /// Events the server pushed, which answer nothing.
     Events(Vec<ControlEvent>),
 }
 
 /// Game-thread half of the control client.
-struct ControlState {
+pub struct Client {
     /// Jobs handed to the worker.
     jobs: flume::Sender<Job>,
-    /// Replies the worker has finished.
+    /// Failures and events the worker has for the game.
     replies: flume::Receiver<Reply>,
-    /// Tickets issued but not yet answered, oldest first.
-    issued: VecDeque<Ticket>,
-    /// Replies that arrived before the game asked for them, oldest first.
-    ready: VecDeque<(Ticket, ControlResponse)>,
     /// Requests waiting to go out together as one batch.
     ///
     /// The game describes many players per tick and the protocol is built to carry that in a single frame, so patches
-    /// pile up here until [`flush`] sends them.
+    /// pile up here until [`Client::flush`] sends them.
     pending: Vec<ControlRequest>,
-    /// Failures from requests nobody is waiting for, oldest first, for [`take_error`] to report.
-    orphan_errors: VecDeque<ControlResponse>,
-    /// Events the server pushed, oldest first, for [`take_events`] to hand over.
+    /// Failures from requests nobody is waiting for, oldest first, for [`Client::take_error`] to report.
+    orphan_errors: VecDeque<String>,
+    /// Events the server pushed, oldest first, for [`Client::take_events`] to hand over.
     events: VecDeque<ControlEvent>,
-    /// Ticket the next request that wants one will be given.
-    next_ticket: Ticket,
+    /// Set when the client goes away, so its worker drops whatever it has not started on.
+    retired: Arc<AtomicBool>,
 }
 
-impl ControlState {
-    /// Create a new control state with the given channels.
+impl Client {
+    /// Create a new client with the given channels.
     fn new(jobs: flume::Sender<Job>, replies: flume::Receiver<Reply>) -> Self {
         Self {
             jobs,
             replies,
-            issued: VecDeque::new(),
-            ready: VecDeque::new(),
             pending: Vec::new(),
             orphan_errors: VecDeque::new(),
             events: VecDeque::new(),
-            next_ticket: FIRST_TICKET,
+            retired: Arc::default(),
         }
     }
 
-    /// Take the next ticket, wrapping rather than overflowing.
-    fn next_ticket(&mut self) -> Ticket {
-        let ticket = self.next_ticket;
-        self.next_ticket = self.next_ticket.checked_add(1).unwrap_or(FIRST_TICKET);
-        ticket
-    }
-
-    /// Queue `request` and take a ticket for its response.
+    /// Start a worker for `endpoint` on a thread of its own, returning the client and the worker's thread.
     ///
-    /// The error says why the request could not be queued at all, which the game has to hear because no ticket will
-    /// ever answer for it.
-    fn submit(&mut self, request: ControlRequest) -> Result<Ticket, String> {
-        let ticket = self.next_ticket();
-        self.submit_inner(request, Some(ticket))?;
-        Ok(ticket)
-    }
+    /// The worker starts once `previous`, the thread of the worker it replaces, has finished. Dropping the client
+    /// stops the worker as soon as it is done with the exchange it is in; whatever is still queued is dropped unsent.
+    pub fn start(
+        endpoint: Endpoint,
+        previous: Option<thread::JoinHandle<()>>,
+    ) -> Result<(Self, thread::JoinHandle<()>), String> {
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("failed to build the control runtime: {err}"))?;
 
-    /// Queue `request` without taking a ticket, for a request whose answer nobody collects.
-    ///
-    /// One that cannot be queued at all leaves its failure for [`ControlState::take_error`]: there is no ticket to
-    /// answer on, and the game has to hear that what it described never went out.
-    fn submit_and_forget(&mut self, request: ControlRequest) {
-        if let Err(refused) = self.submit_inner(request, None) {
-            self.push_orphan_error(error(refused));
-        }
-    }
+        let (jobs_tx, jobs_rx) = flume::bounded(JOB_QUEUE_DEPTH);
+        let (replies_tx, replies_rx) = flume::unbounded();
 
-    /// Hand `request` to the worker, remembering `ticket` as outstanding when there is one.
-    fn submit_inner(&mut self, request: ControlRequest, ticket: Option<Ticket>) -> Result<(), String> {
-        match self.jobs.try_send(Job { ticket, request }) {
-            Ok(()) => {
-                if let Some(ticket) = ticket {
-                    self.issued.push_back(ticket);
+        let client = Self::new(jobs_tx, replies_rx);
+        let worker = Worker::new(endpoint, jobs_rx, replies_tx, client.retired.clone());
+
+        let thread = thread::Builder::new()
+            .name("sada-control".to_owned())
+            .spawn(move || {
+                if let Some(previous) = previous {
+                    let _ = previous.join();
                 }
-                Ok(())
-            },
-            Err(flume::TrySendError::Full(_)) => Err("control queue is full".to_owned()),
-            Err(flume::TrySendError::Disconnected(_)) => Err("control worker has stopped".to_owned()),
+                worker.serve(runtime)
+            })
+            .map_err(|err| format!("failed to spawn the control worker: {err}"))?;
+
+        Ok((client, thread))
+    }
+
+    /// Hand `job` to the worker without waiting, or say why it could not be.
+    fn queue(&self, job: Job) -> Result<(), String> {
+        self.jobs.try_send(job).map_err(|refused| match refused {
+            flume::TrySendError::Full(_) => "control queue is full".to_owned(),
+            flume::TrySendError::Disconnected(_) => "control worker has stopped".to_owned(),
+        })
+    }
+
+    /// Queue `request` now and return a future for its answer, or say why it could not be queued.
+    ///
+    /// The request takes its place among the jobs at the call, not when the future is first polled, so it travels in
+    /// order with whatever the game queues around it. One the worker has not started on after [`ANSWER_TIMEOUT`] is
+    /// answered with that and never sent; one it has started on is waited for until the exchange is over.
+    pub fn submit(
+        &self,
+        request: ControlRequest,
+    ) -> Result<impl Future<Output = ControlResponse> + Send + 'static + use<>, String> {
+        let (answer, mut answered) = oneshot::channel();
+        let claim = Arc::new(AtomicBool::new(false));
+
+        self.queue(Job {
+            request,
+            waiter: Some(Waiter {
+                answer,
+                claim: claim.clone(),
+            }),
+        })?;
+
+        Ok(async move {
+            let answer = match timeout(ANSWER_TIMEOUT, &mut answered).await {
+                Ok(answer) => answer,
+                Err(_) if take(&claim) => return error("the voice server did not get to the request in time"),
+                Err(_) => answered.await,
+            };
+
+            answer.unwrap_or_else(|_| error("the control worker stopped before the server answered"))
+        })
+    }
+
+    /// Queue `request` without anybody waiting for its answer.
+    ///
+    /// One that cannot be queued at all leaves its failure for [`Client::take_error`]: nobody else will hear of it,
+    /// and the game has to hear that what it described never went out.
+    fn submit_and_forget(&mut self, request: ControlRequest) {
+        if let Err(refused) = self.queue(Job { request, waiter: None }) {
+            self.push_orphan_error(refused);
         }
     }
 
-    /// Answer a request the client refused itself, on a ticket the game can collect like any other.
-    ///
-    /// Nothing is sent, so there is no response to wait for; the answer is ready before the ticket is handed out.
-    fn refuse(&mut self, message: String) -> Ticket {
-        let ticket = self.next_ticket();
-        self.push_ready(ticket, error(message));
-        ticket
-    }
-
-    /// Add `request` to the batch that the next [`ControlState::flush`] will send.
+    /// Add `request` to the batch that the next [`Client::flush`] will send.
     fn enqueue(&mut self, request: ControlRequest) {
         if self.pending.len() >= MAX_PENDING_REQUESTS {
-            self.push_orphan_error(error("control batch overflowed, the game is not flushing it"));
+            self.push_orphan_error("control batch overflowed, the game is not flushing it".to_owned());
             return;
         }
 
@@ -186,7 +221,7 @@ impl ControlState {
     }
 
     /// Send everything that has piled up as one batch.
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         if self.pending.is_empty() {
             return;
         }
@@ -196,36 +231,44 @@ impl ControlState {
         self.submit_and_forget(batch);
     }
 
-    /// Move everything the worker has finished into the queues the game collects from.
+    /// Add one player's state delta to the batch that the next [`Client::flush`] will send.
+    ///
+    /// The error says why the patch was refused outright.
+    pub fn patch_player(&mut self, player: &str, patch: PlayerPatch) -> Result<(), String> {
+        let player = parse_player(player)?;
+        self.enqueue(ControlRequest::PatchPlayer { player, patch });
+        Ok(())
+    }
+
+    /// Forget a player entirely, behind whatever is still batched.
+    pub fn remove_player(&mut self, player: PlayerId) {
+        // This has to travel behind whatever is still batched. A patch overtaken by the removal would land on a
+        // vacant entry and recreate the player, who would then stay in the routing table for the rest of the round.
+        self.enqueue(ControlRequest::RemovePlayer { player });
+        self.flush();
+    }
+
+    /// Send one transmit change, without waiting for it.
+    pub fn set_transmit(&mut self, session: SessionId, transmit: Option<Transmit>) {
+        self.submit_and_forget(ControlRequest::SetTransmit { session, transmit });
+    }
+
+    /// Move everything the worker has for the game into the queues the game collects from.
     fn drain(&mut self) {
         while let Ok(reply) = self.replies.try_recv() {
             match reply {
-                Reply::Answer(Some(ticket), response) => {
-                    if let Some(at) = self.issued.iter().position(|t| *t == ticket) {
-                        self.issued.remove(at);
-                    }
-                    self.push_ready(ticket, response);
-                },
-                Reply::Answer(None, response) => self.push_orphan_error(response),
+                Reply::Failure(message) => self.push_orphan_error(message),
                 Reply::Events(events) => self.push_events(events),
             }
         }
     }
 
-    /// Record one reply, dropping the oldest if the game has stopped collecting them.
-    fn push_ready(&mut self, ticket: Ticket, response: ControlResponse) {
-        if self.ready.len() >= MAX_READY_REPLIES {
-            self.ready.pop_front();
-        }
-        self.ready.push_back((ticket, response));
-    }
-
     /// Record one failure nobody is waiting for, dropping the oldest if the game has stopped taking them.
-    fn push_orphan_error(&mut self, response: ControlResponse) {
-        if self.orphan_errors.len() >= MAX_READY_REPLIES {
+    fn push_orphan_error(&mut self, message: String) {
+        if self.orphan_errors.len() >= MAX_QUEUED_ERRORS {
             self.orphan_errors.pop_front();
         }
-        self.orphan_errors.push_back(response);
+        self.orphan_errors.push_back(message);
     }
 
     /// Record pushed events, dropping the oldest if the game has stopped taking them.
@@ -240,35 +283,14 @@ impl ControlState {
         }
     }
 
-    /// Collect the response for `ticket`, if it has arrived.
-    fn poll(&mut self, ticket: Ticket) -> Poll {
+    /// Take the oldest error that nobody was waiting for.
+    pub fn take_error(&mut self) -> Option<String> {
         self.drain();
-
-        if let Some(at) = self.ready.iter().position(|(t, _)| *t == ticket) {
-            let (_, response) = self.ready.remove(at).expect("position came from this deque");
-            return Poll::Ready(response);
-        }
-
-        if self.issued.contains(&ticket) {
-            Poll::Pending
-        } else {
-            Poll::Unknown
-        }
-    }
-
-    /// Take the oldest error that no ticket was waiting for.
-    fn take_error(&mut self) -> Option<String> {
-        self.drain();
-
-        match self.orphan_errors.pop_front() {
-            Some(ControlResponse::Error { message }) => Some(message),
-            Some(unexpected) => unreachable!("got a non-error response to a fire-and-forget request: {unexpected:?}"),
-            None => None,
-        }
+        self.orphan_errors.pop_front()
     }
 
     /// Take up to `max` of the events the server has pushed, oldest first.
-    fn take_events(&mut self, max: usize) -> Vec<ControlEvent> {
+    pub fn take_events(&mut self, max: usize) -> Vec<ControlEvent> {
         self.drain();
 
         let taken = self.events.len().min(max);
@@ -276,6 +298,13 @@ impl ControlState {
         self.events.drain(..taken).collect()
     }
 }
+
+impl Drop for Client {
+    fn drop(&mut self) { self.retired.store(true, Ordering::Release); }
+}
+
+/// Take `claim` for the side calling this, or say the other side already has it.
+fn take(claim: &AtomicBool) -> bool { !claim.swap(true, Ordering::AcqRel) }
 
 /// The two ends of one control channel.
 struct Connection {
@@ -291,10 +320,12 @@ struct Worker {
     endpoint: Endpoint,
     /// Jobs from the game thread.
     jobs: flume::Receiver<Job>,
-    /// Finished replies and pushed events, for the game thread.
+    /// Failures nobody is waiting for and pushed events, for the game thread.
     replies: flume::Sender<Reply>,
     /// Current connection, or `None` until the next job reconnects.
     connection: Option<Connection>,
+    /// Set once the client has gone away, after which nothing more is sent.
+    retired: Arc<AtomicBool>,
 }
 
 /// Why one exchange produced no answer.
@@ -303,6 +334,23 @@ enum Failed {
     Refused(String),
     /// Something went wrong on the connection, which cannot be trusted with the next request.
     Broken(String),
+}
+
+/// Why a request got no answer from the server.
+enum Unanswered {
+    /// There was no connection to be had, which only whoever sent the request is told.
+    Unreachable(String),
+    /// The connection broke with the request on it, which the game has already been told.
+    Lost(String),
+}
+
+impl Unanswered {
+    /// What went wrong, for whoever waits on the request.
+    fn into_message(self) -> String {
+        match self {
+            Self::Unreachable(message) | Self::Lost(message) => message,
+        }
+    }
 }
 
 /// What woke the worker up.
@@ -317,16 +365,24 @@ enum Wake {
 
 impl Worker {
     /// Create a new worker with the given channels.
-    fn new(endpoint: Endpoint, jobs: flume::Receiver<Job>, replies: flume::Sender<Reply>) -> Self {
+    fn new(
+        endpoint: Endpoint,
+        jobs: flume::Receiver<Job>,
+        replies: flume::Sender<Reply>,
+        retired: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             endpoint,
             jobs,
             replies,
             connection: None,
+            retired,
         }
     }
 
     /// Serve jobs until the game thread drops its end.
+    ///
+    /// Jobs still queued then are dropped unsent, which answers whoever waits on them with an error.
     async fn run(mut self) {
         loop {
             // A connection there is none of has nothing to wait on, and a channel that has closed would answer at
@@ -345,24 +401,34 @@ impl Worker {
                 },
             };
 
+            if self.retired.load(Ordering::Acquire) {
+                break;
+            }
+
             match wake {
                 Wake::Stopped => break,
                 Wake::Unsolicited(message) => self.on_unsolicited(message),
-                Wake::Job(job) => {
-                    let response = self.exchange(job.request).await;
-
-                    match job.ticket {
-                        Some(ticket) => {
-                            let _ = self.replies.send(Reply::Answer(Some(ticket), response));
-                        },
-                        // Nobody is waiting on a fire-and-forget request, but its failures still have to reach the
-                        // game.
-                        None => {
-                            if let Some(failure) = first_failure(response) {
-                                let _ = self.replies.send(Reply::Answer(None, failure));
-                            }
-                        },
+                Wake::Job(Job {
+                    request,
+                    waiter: Some(Waiter { answer, claim }),
+                }) => {
+                    if !take(&claim) {
+                        continue;
                     }
+
+                    let exchanged = self.exchange(request).await;
+                    let _ = answer.send(exchanged.unwrap_or_else(|failed| error(failed.into_message())));
+                },
+                Wake::Job(Job { request, waiter: None }) => match self.exchange(request).await {
+                    Ok(response) => {
+                        if let Some(failure) = first_failure(response) {
+                            self.report(failure);
+                        }
+                    },
+                    Err(Unanswered::Unreachable(message)) => {
+                        self.report(message);
+                    },
+                    Err(Unanswered::Lost(_)) => {},
                 },
             }
         }
@@ -372,24 +438,33 @@ impl Worker {
     fn serve(self, runtime: runtime::Runtime) { runtime.block_on(self.run()) }
 
     /// Send one request and wait for its answer, connecting first if the last exchange broke the connection.
-    async fn exchange(&mut self, request: ControlRequest) -> ControlResponse {
+    ///
+    /// Fails when there is no connection to be had or this exchange broke it. A connection that breaks is reported to
+    /// the game here, whichever request found it broken; one that could not be made is left to the caller.
+    async fn exchange(&mut self, request: ControlRequest) -> Result<ControlResponse, Unanswered> {
         if self.connection.is_none() {
             match sada_ipc::connect(&self.endpoint).await {
                 Ok((to_server, from_server)) => {
                     self.connection = Some(Connection { to_server, from_server });
                 },
-                Err(err) => return error(format!("failed to connect to {}: {}", self.endpoint, describe(&err))),
+                Err(err) => {
+                    return Err(Unanswered::Unreachable(format!(
+                        "failed to connect to {}: {}",
+                        self.endpoint,
+                        describe(&err)
+                    )));
+                },
             }
         }
 
         match self.exchange_on(request).await {
-            Ok(response) => response,
-            Err(Failed::Refused(message)) => error(message),
+            Ok(response) => Ok(response),
+            Err(Failed::Refused(message)) => Ok(error(message)),
+            // Half of a frame may have gone out, so the connection is no longer trustworthy. Drop it and let the next
+            // job reconnect; retrying this one could apply it twice.
             Err(Failed::Broken(message)) => {
-                // Half of a frame may have gone out, so the connection is no longer trustworthy. Drop it and let the
-                // next job reconnect; retrying this one could apply it twice.
                 self.connection = None;
-                error(message)
+                Err(Unanswered::Lost(self.report(message)))
             },
         }
     }
@@ -453,7 +528,13 @@ impl Worker {
     /// Drop the connection and tell the game why.
     fn lost(&mut self, reason: impl Into<String>) {
         self.connection = None;
-        let _ = self.replies.send(Reply::Answer(None, error(reason)));
+        self.report(reason.into());
+    }
+
+    /// Tell the game about a failure nobody is waiting for, handing the message back.
+    fn report(&self, message: String) -> String {
+        let _ = self.replies.send(Reply::Failure(message.clone()));
+        message
     }
 }
 
@@ -490,73 +571,47 @@ fn describe(err: &dyn Error) -> String {
 ///
 /// A batch answers with one response per element, so a rejected patch sitting among successes would otherwise leave
 /// no trace at all: the batch itself succeeded.
-fn first_failure(response: ControlResponse) -> Option<ControlResponse> {
+fn first_failure(response: ControlResponse) -> Option<String> {
     match response {
-        failure @ ControlResponse::Error { .. } => Some(failure),
+        ControlResponse::Error { message } => Some(message),
         ControlResponse::Batch(responses) => responses.into_iter().find_map(first_failure),
         _ => None,
     }
 }
 
-/// Run `f` against the installed control state.
+/// Run `f` against the installed control client.
 ///
-/// Returns `None` when [`init`] has not been called, which the exports report as an error rather than a panic.
-fn with_control<T>(f: impl FnOnce(&mut ControlState) -> T) -> Result<T, String> {
+/// Fails when [`init`] has not been called, which the exports report as an error rather than a panic.
+fn with_control<T>(f: impl FnOnce(&mut Client) -> T) -> Result<T, String> {
     CONTROL
         .with_borrow_mut(|slot| slot.as_mut().map(f))
         .ok_or_else(|| "control client is not running".to_owned())
 }
 
-/// Queue `request` without waiting for the server.
+/// Start the worker, replacing any that is running, and ask the server for its version.
 ///
-/// Returns the ticket its response will arrive under, or the reason it could not be queued at all.
-fn submit(request: ControlRequest) -> Result<Ticket, String> { with_control(|control| control.submit(request))? }
+/// A client this replaces is stopped as by [`stop`], and the new worker starts only once the last one has finished.
+pub fn init(endpoint: &str) -> impl Future<Output = ControlResponse> + Send + 'static + use<> {
+    let started = Client::start(Endpoint::new(endpoint), LAST_WORKER.take()).map(|(client, worker)| {
+        LAST_WORKER.set(Some(worker));
+        CONTROL.set(Some(client));
+        ControlRequest::Version
+    });
 
-/// Queue `request` without waiting for the server and without a ticket for its answer.
-///
-/// A request that cannot be queued leaves an error for [`take_error`]. The one failure that goes unreported is
-/// having no client at all, because there is then nowhere to record it and nobody collecting.
-fn submit_and_forget(request: ControlRequest) { let _ = with_control(|control| control.submit_and_forget(request)); }
-
-/// Start the worker and ask the server for its version.
-///
-/// Returns the ticket that version answer will arrive under. Connecting happens on the worker, so a server that is
-/// not up yet shows as an error on that ticket rather than as a failure here.
-pub fn init(endpoint: &str) -> Result<Ticket, String> {
-    let runtime = runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| format!("failed to build the control runtime: {err}"))?;
-
-    let (jobs_tx, jobs_rx) = flume::bounded(JOB_QUEUE_DEPTH);
-    let (replies_tx, replies_rx) = flume::unbounded();
-
-    let worker = Worker::new(Endpoint::new(endpoint), jobs_rx, replies_tx);
-    let control = ControlState::new(jobs_tx, replies_rx);
-
-    thread::Builder::new()
-        .name("sada-control".to_owned())
-        .spawn(move || worker.serve(runtime))
-        .map_err(|err| format!("failed to spawn the control worker: {err}"))?;
-
-    CONTROL.set(Some(control));
-
-    submit(ControlRequest::Version)
+    ask(started)
 }
 
-/// Stop the worker and forget every outstanding ticket.
+/// Stop the worker.
 ///
-/// The worker finishes the exchange it is in and then exits, because its job channel is closed, and its runtime goes
-/// with it.
+/// The worker finishes the exchange it is in, if any, and then exits, and its runtime goes with it. Everything not yet
+/// sent is dropped: queued requests, whose callers are answered with an error, the pending batch and any unreported
+/// failures.
 pub fn stop() { CONTROL.set(None); }
 
-/// Collect the response for `ticket`.
-pub fn poll(ticket: Ticket) -> Poll { with_control(|control| control.poll(ticket)).unwrap_or(Poll::Unknown) }
-
-/// Take the oldest error that no ticket was waiting for, such as a failed fire-and-forget request.
+/// Take the oldest error that nobody was waiting for, such as a failed fire-and-forget request.
 ///
 /// There is nothing to report when the client is not running.
-pub fn take_error() -> Option<String> { with_control(ControlState::take_error).ok().flatten() }
+pub fn take_error() -> Option<String> { with_control(Client::take_error).ok().flatten() }
 
 /// Take up to `max` of the events the server has pushed since the last call.
 ///
@@ -568,56 +623,67 @@ pub fn take_events(max: u16) -> Vec<ControlEvent> {
 /// Register a single-use code the game has shown to a player.
 ///
 /// `ckey` is only what the browser that redeems the code is greeted with.
-pub fn register_code(code: &str, player: &str, ckey: &str) -> Result<Ticket, String> {
-    with_control(|control| match parse_player(player) {
-        Ok(player) => control.submit(ControlRequest::RegisterCode {
-            code: AuthCode::from(code),
-            player,
-            ckey: Ckey::from(ckey),
-        }),
-        Err(refused) => Ok(control.refuse(refused)),
-    })?
+pub fn register_code(
+    code: &str,
+    player: &str,
+    ckey: &str,
+) -> impl Future<Output = ControlResponse> + Send + 'static + use<> {
+    let request = parse_player(player).map(|player| ControlRequest::RegisterCode {
+        code: AuthCode::from(code),
+        player,
+        ckey: Ckey::from(ckey),
+    });
+
+    ask(request)
 }
 
 /// Look up the session a player has authenticated, if any.
-pub fn check_auth(player: &str) -> Result<Ticket, String> {
-    with_control(|control| match parse_player(player) {
-        Ok(player) => control.submit(ControlRequest::CheckAuth { player }),
-        Err(refused) => Ok(control.refuse(refused)),
-    })?
+pub fn check_auth(player: &str) -> impl Future<Output = ControlResponse> + Send + 'static + use<> {
+    ask(parse_player(player).map(|player| ControlRequest::CheckAuth { player }))
+}
+
+/// Submit `request` to the installed client, or answer at once with why it could not be built or submitted.
+fn ask(request: Result<ControlRequest, String>) -> impl Future<Output = ControlResponse> + Send + 'static {
+    answered(request.and_then(|request| with_control(|control| control.submit(request))?))
+}
+
+/// The answer `submitted` resolves to, or why it could not be submitted at all.
+async fn answered(submitted: Result<impl Future<Output = ControlResponse>, String>) -> ControlResponse {
+    match submitted {
+        Ok(answer) => answer.await,
+        Err(message) => error(message),
+    }
 }
 
 /// Start transmitting, either locally or on a radio frequency.
 ///
 /// `channel` is the raw frequency, or `None` for local speech.
 pub fn start_transmitting(session: SessionId, channel: Option<u16>) {
-    let transmit = Some(channel.map_or(Transmit::Local, |freq| Transmit::Radio(Freq(freq))));
-    set_transmit(session, transmit);
+    set_transmit(
+        session,
+        Some(channel.map_or(Transmit::Local, |freq| Transmit::Radio(Freq(freq)))),
+    );
 }
 
 /// Stop transmitting.
 pub fn stop_transmitting(session: SessionId) { set_transmit(session, None); }
 
-/// Send one transmit change.
-///
-/// Split out for convenience on the DM side.
+/// Send one transmit change, if the client is running.
 fn set_transmit(session: SessionId, transmit: Option<Transmit>) {
-    submit_and_forget(ControlRequest::SetTransmit { session, transmit });
+    let _ = with_control(|control| control.set_transmit(session, transmit));
 }
 
 /// Add one player's state delta to the batch that the next [`flush`] will send.
 ///
 /// Nothing reaches the channel until [`flush`]; the error says why the patch was refused outright.
 pub fn patch_player(player: &str, patch: PlayerPatch) -> Result<(), String> {
-    let player = parse_player(player)?;
-
     // Reporting a dropped patch as accepted would leave the game believing it had described a player it never did,
     // and there is no error queue to fall back on when there is no client at all.
-    with_control(|control| control.enqueue(ControlRequest::PatchPlayer { player, patch }))
+    with_control(|control| control.patch_player(player, patch))?
 }
 
 /// Send everything [`patch_player`] has piled up as one batch.
-pub fn flush() { let _ = with_control(ControlState::flush); }
+pub fn flush() { let _ = with_control(Client::flush); }
 
 /// Forget a player entirely.
 ///
@@ -629,17 +695,13 @@ pub fn remove_player(player: &str) {
     // The id goes back to the pool whether or not the removal reaches the server: the game is done with this player.
     player::forget(player);
 
-    let _ = with_control(|control| {
-        // This has to travel behind whatever is still batched. A patch overtaken by the removal would land on a
-        // vacant entry and recreate the player, who would then stay in the routing table for the rest of the round.
-        control.enqueue(ControlRequest::RemovePlayer { player });
-        control.flush();
-    });
+    let _ = with_control(|control| control.remove_player(player));
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         sync::{
             atomic::{AtomicU32, Ordering},
             mpsc,
@@ -759,29 +821,40 @@ mod tests {
         }
     }
 
-    /// Start the client against `endpoint`, as `init` does for the game.
-    fn start(endpoint: &Endpoint) -> Ticket { init(endpoint.as_str()).expect("the worker starts") }
+    /// Start a client against `endpoint`, as `init` does for the game.
+    fn start(endpoint: &Endpoint) -> Client { Client::start(endpoint.clone(), None).expect("the worker starts").0 }
 
-    /// Wait for `ticket` to be answered.
-    fn wait(ticket: Ticket) -> ControlResponse {
-        let deadline = Instant::now() + PATIENCE;
-
-        loop {
-            match poll(ticket) {
-                Poll::Ready(response) => return response,
-                Poll::Pending => assert!(Instant::now() < deadline, "the worker never answered"),
-                Poll::Unknown => panic!("ticket {ticket} was never issued"),
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+    /// Drive `future` to completion on a runtime of the test's own, as the async exports' runtime would.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the test")
+            .block_on(future)
     }
 
-    /// Wait for a failure nobody held a ticket for.
-    fn wait_for_error() -> String {
+    /// Send `request` and wait for its answer, the way an awaited export does.
+    fn ask(control: &Client, request: ControlRequest) -> ControlResponse {
+        let answer = answered(control.submit(request));
+        let answer = block_on(async { timeout(PATIENCE, answer).await });
+        answer.expect("the worker never answered")
+    }
+
+    /// Ask the server for its version, which every exchange with a fake server starts with.
+    fn version(control: &Client) -> ControlResponse { ask(control, ControlRequest::Version) }
+
+    /// Ask for the session bound to `player`.
+    fn check_auth(control: &Client, player: &str) -> ControlResponse {
+        let player = PlayerId::from_token(player).expect("a player token");
+        ask(control, ControlRequest::CheckAuth { player })
+    }
+
+    /// Wait for a failure nobody was waiting for.
+    fn wait_for_error(control: &mut Client) -> String {
         let deadline = Instant::now() + PATIENCE;
 
         loop {
-            if let Some(message) = take_error() {
+            if let Some(message) = control.take_error() {
                 return message;
             }
             assert!(Instant::now() < deadline, "the failure never reached the game");
@@ -790,11 +863,11 @@ mod tests {
     }
 
     /// Wait for the server to push something.
-    fn wait_for_events() -> Vec<ControlEvent> {
+    fn wait_for_events(control: &mut Client) -> Vec<ControlEvent> {
         let deadline = Instant::now() + PATIENCE;
 
         loop {
-            let events = take_events(32);
+            let events = control.take_events(32);
 
             if !events.is_empty() {
                 return events;
@@ -814,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ticket_carries_the_response() {
+    fn a_request_is_answered() {
         let endpoint = endpoint();
         let (server, _seen) = serve(
             &endpoint,
@@ -824,33 +897,14 @@ mod tests {
             },
         );
 
-        let version = start(&endpoint);
-        assert!(matches!(wait(version), ControlResponse::Version { .. }));
+        let control = start(&endpoint);
+        assert!(matches!(version(&control), ControlResponse::Version { .. }));
+        assert!(matches!(
+            check_auth(&control, &player("sefa")),
+            ControlResponse::Session { session: None }
+        ));
 
-        let auth = check_auth(&player("sefa")).expect("the request is queued");
-        assert!(matches!(wait(auth), ControlResponse::Session { session: None }));
-
-        stop();
-        server.join().expect("the fake server does not panic");
-    }
-
-    #[test]
-    fn a_collected_ticket_is_not_offered_twice() {
-        let endpoint = endpoint();
-        let (server, _seen) = serve(
-            &endpoint,
-            Plan {
-                answers: 1,
-                ..Plan::default()
-            },
-        );
-
-        let version = start(&endpoint);
-        assert!(matches!(wait(version), ControlResponse::Version { .. }));
-
-        assert!(matches!(poll(version), Poll::Unknown));
-
-        stop();
+        drop(control);
         server.join().expect("the fake server does not panic");
     }
 
@@ -865,17 +919,20 @@ mod tests {
             },
         );
 
-        let version = start(&endpoint);
-        assert!(matches!(wait(version), ControlResponse::Version { .. }));
+        let mut control = start(&endpoint);
+        assert!(matches!(version(&control), ControlResponse::Version { .. }));
         first.join().expect("the fake server does not panic");
 
         let sefa = player("sefa");
 
-        let orphaned = check_auth(&sefa).expect("the request is queued");
         assert!(
-            matches!(wait(orphaned), ControlResponse::Error { .. }),
+            matches!(check_auth(&control, &sefa), ControlResponse::Error { .. }),
             "a request sent to a server that has gone away has to fail rather than hang"
         );
+
+        // The connection that request found broken is lost for everybody, and the game can only start over if it
+        // hears of that too, whoever happened to be waiting.
+        wait_for_error(&mut control);
 
         let (second, _seen) = serve(
             &endpoint,
@@ -884,13 +941,12 @@ mod tests {
                 ..Plan::default()
             },
         );
-        let after_restart = check_auth(&sefa).expect("the request is queued");
         assert!(
-            matches!(wait(after_restart), ControlResponse::Session { session: None }),
+            matches!(check_auth(&control, &sefa), ControlResponse::Session { session: None }),
             "the next request has to reconnect on its own"
         );
 
-        stop();
+        drop(control);
         second.join().expect("the fake server does not panic");
     }
 
@@ -905,8 +961,8 @@ mod tests {
             },
         );
 
-        let version = start(&endpoint);
-        wait(version);
+        let mut control = start(&endpoint);
+        version(&control);
         seen.recv().expect("the version request");
 
         let sefa = player("sefa");
@@ -916,9 +972,9 @@ mod tests {
             ..PlayerPatch::default()
         };
 
-        assert!(patch_player(&sefa, patch).is_ok());
-        assert!(patch_player(&player("ahmet"), muted()).is_ok());
-        flush();
+        assert!(control.patch_player(&sefa, patch).is_ok());
+        assert!(control.patch_player(&player("ahmet"), muted()).is_ok());
+        control.flush();
 
         let batch = seen.recv_timeout(PATIENCE).expect("the batch reaches the server");
         let ControlRequest::Batch(requests) = batch else {
@@ -934,7 +990,7 @@ mod tests {
                     && patch.position.is_some_and(|at| (at.x, at.y, at.z) == (4, 9, 2))
         ));
 
-        stop();
+        drop(control);
         server.join().expect("the fake server does not panic");
     }
 
@@ -951,18 +1007,21 @@ mod tests {
             },
         );
 
-        let version = start(&endpoint);
-        wait(version);
+        let mut control = start(&endpoint);
+        version(&control);
         seen.recv().expect("the version request");
 
-        assert!(patch_player("", muted()).is_err(), "no player at all");
-        assert!(patch_player("sefa", muted()).is_err(), "a ckey where a token belongs");
-        flush();
+        assert!(control.patch_player("", muted()).is_err(), "no player at all");
+        assert!(
+            control.patch_player("sefa", muted()).is_err(),
+            "a ckey where a token belongs"
+        );
+        control.flush();
 
         // Nothing was queued, so flush has nothing to send and the server sees no second request.
         assert!(seen.recv_timeout(Duration::from_millis(200)).is_err());
 
-        stop();
+        drop(control);
         server.join().expect("the fake server does not panic");
     }
 
@@ -979,18 +1038,18 @@ mod tests {
             },
         );
 
-        let version = start(&endpoint);
-        wait(version);
+        let mut control = start(&endpoint);
+        version(&control);
 
         // The batch itself succeeds; only one of its elements is rejected.
-        assert!(patch_player(&player("sefa"), muted()).is_ok());
-        assert!(patch_player(&poison.token(), muted()).is_ok());
-        flush();
+        assert!(control.patch_player(&player("sefa"), muted()).is_ok());
+        assert!(control.patch_player(&poison.token(), muted()).is_ok());
+        control.flush();
 
-        let message = wait_for_error();
+        let message = wait_for_error(&mut control);
         assert!(message.contains("cannot be patched"), "got {message}");
 
-        stop();
+        drop(control);
         server.join().expect("the fake server does not panic");
     }
 
@@ -1005,15 +1064,15 @@ mod tests {
             },
         );
 
-        let version = start(&endpoint);
-        wait(version);
+        let mut control = start(&endpoint);
+        version(&control);
         seen.recv().expect("the version request");
 
         // A patch left in the batch and then a removal. Order is the whole point: were the removal to overtake the
         // patch, the patch would land on a vacant entry and bring the player back for the rest of the round.
         let sefa = player("sefa");
-        assert!(patch_player(&sefa, muted()).is_ok());
-        remove_player(&sefa);
+        assert!(control.patch_player(&sefa, muted()).is_ok());
+        control.remove_player(PlayerId::from_token(&sefa).expect("a player token"));
 
         let batch = seen.recv_timeout(PATIENCE).expect("the removal");
         let ControlRequest::Batch(requests) = batch else {
@@ -1023,7 +1082,7 @@ mod tests {
         assert!(matches!(&requests[0], ControlRequest::PatchPlayer { player, .. } if player.token() == sefa));
         assert!(matches!(&requests[1], ControlRequest::RemovePlayer { player } if player.token() == sefa));
 
-        stop();
+        drop(control);
         server.join().expect("the fake server does not panic");
     }
 
@@ -1044,13 +1103,13 @@ mod tests {
             },
         );
 
-        let version = start(&endpoint);
-        wait(version);
+        let mut control = start(&endpoint);
+        version(&control);
 
-        assert_eq!(wait_for_events(), vec![pushed]);
-        assert!(take_events(32).is_empty(), "events are handed over once");
+        assert_eq!(wait_for_events(&mut control), vec![pushed]);
+        assert!(control.take_events(32).is_empty(), "events are handed over once");
 
-        stop();
+        drop(control);
         server.join().expect("the fake server does not panic");
     }
 
@@ -1067,8 +1126,8 @@ mod tests {
             },
         );
 
-        let version = start(&endpoint);
-        assert!(matches!(wait(version), ControlResponse::Version { .. }));
+        let mut control = start(&endpoint);
+        assert!(matches!(version(&control), ControlResponse::Version { .. }));
         seen.recv().expect("the version request");
 
         let bulky = PlayerPatch {
@@ -1078,20 +1137,22 @@ mod tests {
 
         for id in 1..1200 {
             let player = PlayerId::from_raw(id).token();
-            assert!(patch_player(&player, bulky.clone()).is_ok());
+            assert!(control.patch_player(&player, bulky.clone()).is_ok());
         }
-        flush();
+        control.flush();
 
-        let message = wait_for_error();
+        let message = wait_for_error(&mut control);
         assert!(message.contains("refused"), "got {message}");
 
-        let auth = check_auth(&player("sefa")).expect("the request is queued");
         assert!(
-            matches!(wait(auth), ControlResponse::Session { session: None }),
+            matches!(
+                check_auth(&control, &player("sefa")),
+                ControlResponse::Session { session: None }
+            ),
             "the connection the refused batch never touched is still good"
         );
 
-        stop();
+        drop(control);
         server.join().expect("the fake server does not panic");
     }
 
@@ -1099,7 +1160,7 @@ mod tests {
     fn the_event_queue_keeps_the_newest_of_an_oversized_frame() {
         let (jobs, _held) = flume::bounded(1);
         let (_replies, answers) = flume::unbounded();
-        let mut control = ControlState::new(jobs, answers);
+        let mut control = Client::new(jobs, answers);
 
         let events = Vec::from_iter(
             (0..MAX_QUEUED_EVENTS as u32 + 10).map(|player| ControlEvent::Disconnected {
@@ -1127,12 +1188,12 @@ mod tests {
         let endpoint = endpoint();
 
         // No server at all, nothing is listening on this endpoint.
-        start(&endpoint);
-        stop_transmitting(SessionId::new(1, 1));
+        let mut control = start(&endpoint);
+        control.set_transmit(SessionId::new(1, 1), None);
 
-        wait_for_error();
+        wait_for_error(&mut control);
 
-        stop();
+        drop(control);
     }
 
     #[test]
@@ -1142,12 +1203,9 @@ mod tests {
         // description for the rest of the round.
         let (jobs, held) = flume::bounded(0);
         let (_replies, answers) = flume::unbounded();
-        let mut control = ControlState::new(jobs, answers);
+        let mut control = Client::new(jobs, answers);
 
-        control.enqueue(ControlRequest::PatchPlayer {
-            player: player::issue("sefa").expect("a free id"),
-            patch: muted(),
-        });
+        assert!(control.patch_player(&player("sefa"), muted()).is_ok());
         control.flush();
 
         let message = control.take_error().expect("the lost batch leaves an error");
@@ -1157,10 +1215,216 @@ mod tests {
     }
 
     #[test]
+    fn a_request_the_worker_drops_is_answered_with_an_error() {
+        // A worker that goes away with the job in hand, as it does when it cannot be kept running, must not leave the
+        // proc waiting on the answer asleep for good.
+        let (jobs, worker) = flume::bounded(1);
+        let (_replies, answers) = flume::unbounded();
+        let control = Client::new(jobs, answers);
+
+        let worker = thread::spawn(move || drop(worker.recv()));
+
+        let answer = version(&control);
+        assert!(
+            matches!(&answer, ControlResponse::Error { message } if message.contains("stopped")),
+            "got {answer:?}"
+        );
+
+        worker.join().expect("the worker does not panic");
+    }
+
+    #[test]
+    fn a_waited_request_on_a_full_queue_is_answered_at_once() {
+        // Waiting for room would leave the proc asleep behind every exchange a wedged server times out on.
+        let (jobs, held) = flume::bounded(0);
+        let (_replies, answers) = flume::unbounded();
+        let control = Client::new(jobs, answers);
+
+        let answer = version(&control);
+        assert!(
+            matches!(&answer, ControlResponse::Error { message } if message.contains("full")),
+            "got {answer:?}"
+        );
+
+        drop(held);
+    }
+
+    /// Drive `future` on a runtime whose clock is paused, so it skips ahead to the next timer whenever it would idle.
+    fn block_on_paused<F: Future>(future: F) -> F::Output {
+        runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("a runtime for the test")
+            .block_on(future)
+    }
+
+    #[test]
+    fn a_request_the_worker_never_gets_to_is_answered_in_time_and_never_sent() {
+        // A worker stuck behind a wedged server holds on to the job and never answers it.
+        let (jobs, held) = flume::bounded(1);
+        let (_replies, answers) = flume::unbounded();
+        let control = Client::new(jobs, answers);
+
+        let answer = block_on_paused(control.submit(ControlRequest::Version).expect("room in the queue"));
+
+        assert!(
+            matches!(&answer, ControlResponse::Error { message } if message.contains("in time")),
+            "got {answer:?}"
+        );
+
+        // Sent after its caller was told it did not come, a registration would retire the code the player still has.
+        let job = held.try_recv().expect("the job is still queued");
+        let waiter = job.waiter.expect("somebody waited on it");
+        assert!(!take(&waiter.claim), "the worker has to find the request given up on");
+    }
+
+    #[test]
+    fn a_request_the_worker_has_started_on_is_waited_for_past_the_deadline() {
+        let (jobs, held) = flume::bounded(1);
+        let (_replies, answers) = flume::unbounded();
+        let control = Client::new(jobs, answers);
+
+        let answer = control.submit(ControlRequest::Version).expect("room in the queue");
+
+        let job = held.try_recv().expect("the job is queued");
+        let Waiter { answer: reply, claim } = job.waiter.expect("somebody waits on it");
+        assert!(take(&claim), "nobody has given up on it yet");
+
+        let answer = block_on_paused(async move {
+            tokio::spawn(async move {
+                tokio::time::sleep(ANSWER_TIMEOUT * 2).await;
+                let _ = reply.send(ControlResponse::Ok);
+            });
+
+            answer.await
+        });
+
+        assert!(matches!(answer, ControlResponse::Ok), "got {answer:?}");
+    }
+
+    #[test]
+    fn a_waited_request_that_cannot_connect_leaves_no_error() {
+        // Nothing was lost, so only the caller hears of it; telling the game too would re-describe every player.
+        let endpoint = endpoint();
+        let mut control = start(&endpoint);
+
+        let answer = version(&control);
+        assert!(
+            matches!(&answer, ControlResponse::Error { message } if message.contains("failed to connect")),
+            "got {answer:?}"
+        );
+
+        // The worker answers after anything it reports, so a report would already be waiting.
+        assert_eq!(control.take_error(), None);
+    }
+
+    #[test]
+    fn a_retired_worker_sends_nothing_more() {
+        // With nothing listening, a request that went out would be answered with the failed connect instead.
+        let endpoint = endpoint();
+        let (jobs, queued) = flume::bounded(1);
+        let (replies, answers) = flume::unbounded();
+        let control = Client::new(jobs, answers);
+        let worker = Worker::new(endpoint, queued, replies, control.retired.clone());
+
+        let answer = control.submit(ControlRequest::Version).expect("room in the queue");
+        drop(control);
+
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the worker");
+        thread::spawn(move || worker.serve(runtime))
+            .join()
+            .expect("the worker does not panic");
+
+        let answer = block_on(answer);
+        assert!(
+            matches!(&answer, ControlResponse::Error { message } if message.contains("stopped")),
+            "got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_code_registered_before_a_removal_reaches_the_server_first() {
+        // Overtaken by the removal, the registration would leave a live code behind for a player the game is done
+        // with. The exports go through the client they share, which is thread-local, so this test has its own.
+        let endpoint = endpoint();
+        let (server, seen) = serve(
+            &endpoint,
+            Plan {
+                answers: 3,
+                ..Plan::default()
+            },
+        );
+
+        assert!(matches!(
+            block_on(init(endpoint.as_str())),
+            ControlResponse::Version { .. }
+        ));
+
+        let sefa = player("sefa");
+        let registered = register_code("ABC123", &sefa, "sefa");
+        remove_player(&sefa);
+
+        assert!(matches!(block_on(registered), ControlResponse::Ok));
+
+        let order = Vec::from_iter((0..3).map(|_| seen.recv_timeout(PATIENCE).expect("every request")));
+        assert!(matches!(order[0], ControlRequest::Version));
+        assert!(matches!(order[1], ControlRequest::RegisterCode { .. }), "got {order:?}");
+        assert!(
+            matches!(&order[2], ControlRequest::Batch(requests) if matches!(requests[..], [ControlRequest::RemovePlayer { .. }])),
+            "got {order:?}"
+        );
+
+        stop();
+        server.join().expect("the fake server does not panic");
+    }
+
+    #[test]
+    fn a_stop_right_after_init_still_answers_it() {
+        let endpoint = endpoint();
+
+        let answer = init(endpoint.as_str());
+        stop();
+
+        let answer = block_on(answer);
+        assert!(
+            matches!(&answer, ControlResponse::Error { message } if message.contains("failed to connect") || message.contains("stopped")),
+            "got {answer:?}"
+        );
+        assert!(matches!(
+            block_on(super::check_auth(&player("sefa"))),
+            ControlResponse::Error { message } if message.contains("not running")
+        ));
+    }
+
+    #[test]
+    fn removing_a_player_frees_their_id() {
+        let (first, second) = player::COLLIDING;
+        let token = player(first);
+        assert!(
+            player::issue(second).is_none(),
+            "the id is taken while its holder is in the game"
+        );
+
+        remove_player(&token);
+
+        assert!(
+            player::issue(second).is_some(),
+            "the id is free once its holder is removed"
+        );
+    }
+
+    #[test]
     fn nothing_is_asked_of_a_client_that_is_not_running() {
         assert_eq!(take_error(), None);
         assert!(take_events(32).is_empty());
-        assert!(matches!(poll(FIRST_TICKET), Poll::Unknown));
         assert!(patch_player(&player("sefa"), muted()).is_err());
+        assert!(matches!(
+            block_on(super::check_auth(&player("sefa"))),
+            ControlResponse::Error { .. }
+        ));
     }
 }

@@ -11,17 +11,19 @@
 
 /world/New()
 	. = ..()
+	// keeps game ticking
+	spawn(0)
+		while(TRUE)
+			sleep(world.tick_lag)
+
 	world.log << "sada client version: [sada_get_version()]"
 
 	var/datum/sada_response/version/response
-	try response = sada_init(SADA_TEST_SOCKET).wait()
-	catch(var/error1)
-		world.log << "sada init failed: [error1]"
-		Del()
-		return
 
-	if(istype(response, /datum/sada_response/error))
-		world.log << "sada init failed2: [astype(response, /datum/sada_response/error).message]"
+	try
+		response = sada_init(SADA_TEST_SOCKET)
+	catch(var/init_error)
+		world.log << "sada init failed: [init_error]"
 		Del()
 		return
 
@@ -103,29 +105,32 @@
 	var/code = "TEST42"
 	var/alpha = sada_player_id("alpha")
 
-	// wait() throws both for a failure the server reported and for a ticket that went away, so a
-	// response that arrives at all is a real one and only needs its type checked.
 	var/datum/sada_response/ok/response
-	try response = sada_register_code(code, alpha, "alpha").wait()
+
+	try
+		response = sada_register_code(code, alpha, "alpha")
 	catch(var/register_error)
 		world.log << "FAIL: registering a code failed: [register_error]"
 		return
 
-	if(!istype(response, /datum/sada_response/ok))
-		world.log << "FAIL: registering a code returned [response] instead of ok."
+	world.log << "OK: registered auth code [code] for alpha; enter it in the web client to bind a session."
+
+	// Answered from a callback, where every reference is persistent; the library has
+	// to let go of its own, or every awaited answer would outlive its caller.
+	if(refcount(response) != 1)
+		world.log << "FAIL: an awaited answer is held [refcount(response)] times, expected only by its caller."
 	else
-		world.log << "OK: registered auth code [code] for alpha; enter it in the web client to bind a session."
+		world.log << "OK: an awaited answer is held only by its caller."
 
 	var/datum/sada_response/session/auth
-	try auth = sada_check_auth(alpha).wait()
+
+	try
+		auth = sada_check_auth(alpha)
 	catch(var/auth_error)
 		world.log << "FAIL: checking auth failed: [auth_error]"
 		return
 
-	if(!istype(auth, /datum/sada_response/session))
-		world.log << "FAIL: checking auth returned [auth] instead of a session."
-	else
-		world.log << "OK: checking auth returned a session token ([auth.session])."
+	world.log << "OK: checking auth returned a session token ([auth.session])."
 
 // Session ids are 64 bit and DM numbers are single-precision floats, so the client
 // hands them over as strings. Decoding one as a number loses the low bits, which is

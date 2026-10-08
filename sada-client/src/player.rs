@@ -57,14 +57,15 @@ pub fn issue(ckey: &str) -> Option<PlayerId> {
 /// Free the id `player` was issued, because the game removed them.
 pub fn forget(player: PlayerId) { ISSUED.with_borrow_mut(|issued| issued.remove(&player)); }
 
+/// Two ckeys that derive the same id, found by searching over the derivation.
+#[cfg(test)]
+pub(crate) const COLLIDING: (&str, &str) = ("zxboiwrq", "iqbltqzu");
+
 #[cfg(test)]
 mod tests {
     use sada_common::PlayerId;
 
-    use super::{derive, forget, issue};
-
-    /// Two ckeys that derive the same id, found by searching over the derivation.
-    const COLLIDING: (&str, &str) = ("zxboiwrq", "iqbltqzu");
+    use super::{COLLIDING, derive, forget, issue};
 
     #[test]
     fn a_ckey_always_derives_the_same_id() {

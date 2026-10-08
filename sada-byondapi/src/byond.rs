@@ -21,9 +21,11 @@ pub fn new(r#type: &CStr, args: &[CByondValue]) -> CByondValue {
 }
 
 /// Drop one reference.
+#[inline]
 pub fn value_decref(value: &CByondValue) { unsafe { BYONDAPI.ByondValue_DecRef(value) }; }
 
 /// Add one reference.
+#[inline]
 pub fn value_incref(value: &CByondValue) { unsafe { BYONDAPI.ByondValue_IncRef(value) }; }
 
 /// Get the reference count of a value.

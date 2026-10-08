@@ -17,7 +17,6 @@ doxygen-rs = { workspace = true, optional = true }
 default = []
 byond-await = ["dep:tokio", "dep:sada-utils"]
 generate-bindings = ["dep:bindgen", "dep:doxygen-rs"]
-sada = []
 
 [lints]
 workspace = true
