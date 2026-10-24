@@ -507,7 +507,7 @@ struct App {
     /// Number of crew added since startup, used to name them.
     spawned: usize,
     /// Id the next crew member is given.
-    next_player: u32,
+    next_player: u64,
 }
 
 impl App {
@@ -520,7 +520,7 @@ impl App {
                 Player::new(PlayerId::from_raw(id), ckey, glyph, x, y, department)
             })
             .collect::<Vec<_>>();
-        let next_player = players.len() as u32 + 1;
+        let next_player = players.len() as u64 + 1;
 
         Ok(Self {
             control: Control::new(endpoint)?,

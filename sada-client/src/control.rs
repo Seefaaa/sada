@@ -232,12 +232,8 @@ impl Client {
     }
 
     /// Add one player's state delta to the batch that the next [`Client::flush`] will send.
-    ///
-    /// The error says why the patch was refused outright.
-    pub fn patch_player(&mut self, player: &str, patch: PlayerPatch) -> Result<(), String> {
-        let player = parse_player(player)?;
+    pub fn patch_player(&mut self, player: PlayerId, patch: PlayerPatch) {
         self.enqueue(ControlRequest::PatchPlayer { player, patch });
-        Ok(())
     }
 
     /// Forget a player entirely, behind whatever is still batched.
@@ -538,11 +534,6 @@ impl Worker {
     }
 }
 
-/// Read a player id token the game passed in.
-fn parse_player(token: &str) -> Result<PlayerId, String> {
-    PlayerId::from_token(token).ok_or_else(|| format!("{token:?} is not a player id"))
-}
-
 /// Build a [`ControlResponse::Error`] from anything printable.
 fn error(message: impl Into<String>) -> ControlResponse {
     ControlResponse::Error {
@@ -588,17 +579,24 @@ fn with_control<T>(f: impl FnOnce(&mut Client) -> T) -> Result<T, String> {
         .ok_or_else(|| "control client is not running".to_owned())
 }
 
+/// The answer to a request the game waits on, or an error saying why it could not be submitted.
+pub async fn answered(submitted: Result<impl Future<Output = ControlResponse>, String>) -> ControlResponse {
+    match submitted {
+        Ok(answer) => answer.await,
+        Err(message) => error(message),
+    }
+}
+
 /// Start the worker, replacing any that is running, and ask the server for its version.
 ///
 /// A client this replaces is stopped as by [`stop`], and the new worker starts only once the last one has finished.
-pub fn init(endpoint: &str) -> impl Future<Output = ControlResponse> + Send + 'static + use<> {
-    let started = Client::start(Endpoint::new(endpoint), LAST_WORKER.take()).map(|(client, worker)| {
+pub fn init(endpoint: &str) -> Result<impl Future<Output = ControlResponse> + Send + 'static + use<>, String> {
+    let request = Client::start(Endpoint::new(endpoint), LAST_WORKER.take()).map(|(client, worker)| {
         LAST_WORKER.set(Some(worker));
         CONTROL.set(Some(client));
         ControlRequest::Version
-    });
-
-    ask(started)
+    })?;
+    with_control(|control| control.submit(request))?
 }
 
 /// Stop the worker.
@@ -625,34 +623,20 @@ pub fn take_events(max: u16) -> Vec<ControlEvent> {
 /// `ckey` is only what the browser that redeems the code is greeted with.
 pub fn register_code(
     code: &str,
-    player: &str,
+    player: PlayerId,
     ckey: &str,
-) -> impl Future<Output = ControlResponse> + Send + 'static + use<> {
-    let request = parse_player(player).map(|player| ControlRequest::RegisterCode {
+) -> Result<impl Future<Output = ControlResponse> + Send + 'static + use<>, String> {
+    let request = ControlRequest::RegisterCode {
         code: AuthCode::from(code),
         player,
         ckey: Ckey::from(ckey),
-    });
-
-    ask(request)
+    };
+    with_control(|control| control.submit(request))?
 }
 
 /// Look up the session a player has authenticated, if any.
-pub fn check_auth(player: &str) -> impl Future<Output = ControlResponse> + Send + 'static + use<> {
-    ask(parse_player(player).map(|player| ControlRequest::CheckAuth { player }))
-}
-
-/// Submit `request` to the installed client, or answer at once with why it could not be built or submitted.
-fn ask(request: Result<ControlRequest, String>) -> impl Future<Output = ControlResponse> + Send + 'static {
-    answered(request.and_then(|request| with_control(|control| control.submit(request))?))
-}
-
-/// The answer `submitted` resolves to, or why it could not be submitted at all.
-async fn answered(submitted: Result<impl Future<Output = ControlResponse>, String>) -> ControlResponse {
-    match submitted {
-        Ok(answer) => answer.await,
-        Err(message) => error(message),
-    }
+pub fn check_auth(player: PlayerId) -> Result<impl Future<Output = ControlResponse> + Send + 'static + use<>, String> {
+    with_control(|control| control.submit(ControlRequest::CheckAuth { player }))?
 }
 
 /// Start transmitting, either locally or on a radio frequency.
@@ -675,12 +659,17 @@ fn set_transmit(session: SessionId, transmit: Option<Transmit>) {
 
 /// Add one player's state delta to the batch that the next [`flush`] will send.
 ///
-/// Nothing reaches the channel until [`flush`]; the error says why the patch was refused outright.
-pub fn patch_player(player: &str, patch: PlayerPatch) -> Result<(), String> {
+/// Nothing reaches the channel until [`flush`].
+pub fn patch_player(player: PlayerId, patch: PlayerPatch) -> Result<(), String> {
     // Reporting a dropped patch as accepted would leave the game believing it had described a player it never did,
     // and there is no error queue to fall back on when there is no client at all.
-    with_control(|control| control.patch_player(player, patch))?
+    with_control(|control| control.patch_player(player, patch))
 }
+
+/// Leave a failure for [`take_error`], for a fire-and-forget request refused before it was ever queued.
+///
+/// There is nobody to tell when the client is not running.
+pub fn report(message: String) { let _ = with_control(|control| control.push_orphan_error(message)); }
 
 /// Send everything [`patch_player`] has piled up as one batch.
 pub fn flush() { let _ = with_control(Client::flush); }
@@ -689,12 +678,9 @@ pub fn flush() { let _ = with_control(Client::flush); }
 ///
 /// This also drops the player's authentication on the server, so it belongs to a client going away rather than to a
 /// player changing mobs.
-pub fn remove_player(player: &str) {
-    let Ok(player) = parse_player(player) else { return };
-
+pub fn remove_player(player: PlayerId) {
     // The id goes back to the pool whether or not the removal reaches the server: the game is done with this player.
     player::forget(player);
-
     let _ = with_control(|control| control.remove_player(player));
 }
 
@@ -741,10 +727,10 @@ mod tests {
         Endpoint::from(std::env::temp_dir().join(format!("sada-client-test-{}-{id}.sock", std::process::id())))
     }
 
-    /// Mint the id for `ckey` the way an export would, and render the token the game passes back.
+    /// Mint the id for `ckey` the way an export would.
     ///
     /// The registry is thread-local and every test runs on its own thread, so one test's ids never meet another's.
-    fn player(ckey: &str) -> String { player::issue(ckey).expect("a free id").token() }
+    fn player(ckey: &str) -> PlayerId { player::issue(ckey).expect("a free id") }
 
     /// Start a fake server on `endpoint` and wait for it to be listening.
     ///
@@ -844,8 +830,7 @@ mod tests {
     fn version(control: &Client) -> ControlResponse { ask(control, ControlRequest::Version) }
 
     /// Ask for the session bound to `player`.
-    fn check_auth(control: &Client, player: &str) -> ControlResponse {
-        let player = PlayerId::from_token(player).expect("a player token");
+    fn check_auth(control: &Client, player: PlayerId) -> ControlResponse {
         ask(control, ControlRequest::CheckAuth { player })
     }
 
@@ -900,7 +885,7 @@ mod tests {
         let control = start(&endpoint);
         assert!(matches!(version(&control), ControlResponse::Version { .. }));
         assert!(matches!(
-            check_auth(&control, &player("sefa")),
+            check_auth(&control, player("sefa")),
             ControlResponse::Session { session: None }
         ));
 
@@ -926,7 +911,7 @@ mod tests {
         let sefa = player("sefa");
 
         assert!(
-            matches!(check_auth(&control, &sefa), ControlResponse::Error { .. }),
+            matches!(check_auth(&control, sefa), ControlResponse::Error { .. }),
             "a request sent to a server that has gone away has to fail rather than hang"
         );
 
@@ -942,7 +927,7 @@ mod tests {
             },
         );
         assert!(
-            matches!(check_auth(&control, &sefa), ControlResponse::Session { session: None }),
+            matches!(check_auth(&control, sefa), ControlResponse::Session { session: None }),
             "the next request has to reconnect on its own"
         );
 
@@ -972,8 +957,8 @@ mod tests {
             ..PlayerPatch::default()
         };
 
-        assert!(control.patch_player(&sefa, patch).is_ok());
-        assert!(control.patch_player(&player("ahmet"), muted()).is_ok());
+        control.patch_player(sefa, patch);
+        control.patch_player(player("ahmet"), muted());
         control.flush();
 
         let batch = seen.recv_timeout(PATIENCE).expect("the batch reaches the server");
@@ -985,41 +970,10 @@ mod tests {
         assert!(matches!(
             &requests[0],
             ControlRequest::PatchPlayer { player, patch }
-                if player.token() == sefa
+                if *player == sefa
                     && patch.mute == Some(false)
                     && patch.position.is_some_and(|at| (at.x, at.y, at.z) == (4, 9, 2))
         ));
-
-        drop(control);
-        server.join().expect("the fake server does not panic");
-    }
-
-    #[test]
-    fn a_patch_for_something_that_is_not_a_player_is_refused_on_the_spot() {
-        // The patch itself is decoded in `PlayerPatch::try_from`, which needs BYOND loaded and so is exercised by
-        // the DM harness instead; what a refusal has to do either way is reach the game rather than vanish here.
-        let endpoint = endpoint();
-        let (server, seen) = serve(
-            &endpoint,
-            Plan {
-                answers: 1,
-                ..Plan::default()
-            },
-        );
-
-        let mut control = start(&endpoint);
-        version(&control);
-        seen.recv().expect("the version request");
-
-        assert!(control.patch_player("", muted()).is_err(), "no player at all");
-        assert!(
-            control.patch_player("sefa", muted()).is_err(),
-            "a ckey where a token belongs"
-        );
-        control.flush();
-
-        // Nothing was queued, so flush has nothing to send and the server sees no second request.
-        assert!(seen.recv_timeout(Duration::from_millis(200)).is_err());
 
         drop(control);
         server.join().expect("the fake server does not panic");
@@ -1042,8 +996,8 @@ mod tests {
         version(&control);
 
         // The batch itself succeeds; only one of its elements is rejected.
-        assert!(control.patch_player(&player("sefa"), muted()).is_ok());
-        assert!(control.patch_player(&poison.token(), muted()).is_ok());
+        control.patch_player(player("sefa"), muted());
+        control.patch_player(poison, muted());
         control.flush();
 
         let message = wait_for_error(&mut control);
@@ -1071,16 +1025,16 @@ mod tests {
         // A patch left in the batch and then a removal. Order is the whole point: were the removal to overtake the
         // patch, the patch would land on a vacant entry and bring the player back for the rest of the round.
         let sefa = player("sefa");
-        assert!(control.patch_player(&sefa, muted()).is_ok());
-        control.remove_player(PlayerId::from_token(&sefa).expect("a player token"));
+        control.patch_player(sefa, muted());
+        control.remove_player(sefa);
 
         let batch = seen.recv_timeout(PATIENCE).expect("the removal");
         let ControlRequest::Batch(requests) = batch else {
             panic!("the removal has to travel behind the batch, got {batch:?}");
         };
 
-        assert!(matches!(&requests[0], ControlRequest::PatchPlayer { player, .. } if player.token() == sefa));
-        assert!(matches!(&requests[1], ControlRequest::RemovePlayer { player } if player.token() == sefa));
+        assert!(matches!(&requests[0], ControlRequest::PatchPlayer { player, .. } if *player == sefa));
+        assert!(matches!(&requests[1], ControlRequest::RemovePlayer { player } if *player == sefa));
 
         drop(control);
         server.join().expect("the fake server does not panic");
@@ -1136,8 +1090,8 @@ mod tests {
         };
 
         for id in 1..1200 {
-            let player = PlayerId::from_raw(id).token();
-            assert!(control.patch_player(&player, bulky.clone()).is_ok());
+            let player = PlayerId::from_raw(id);
+            control.patch_player(player, bulky.clone());
         }
         control.flush();
 
@@ -1146,7 +1100,7 @@ mod tests {
 
         assert!(
             matches!(
-                check_auth(&control, &player("sefa")),
+                check_auth(&control, player("sefa")),
                 ControlResponse::Session { session: None }
             ),
             "the connection the refused batch never touched is still good"
@@ -1163,7 +1117,7 @@ mod tests {
         let mut control = Client::new(jobs, answers);
 
         let events = Vec::from_iter(
-            (0..MAX_QUEUED_EVENTS as u32 + 10).map(|player| ControlEvent::Disconnected {
+            (0..MAX_QUEUED_EVENTS as u64 + 10).map(|player| ControlEvent::Disconnected {
                 player: PlayerId::from_raw(player + 1),
                 session: SessionId::new(1, 1),
             }),
@@ -1205,7 +1159,7 @@ mod tests {
         let (_replies, answers) = flume::unbounded();
         let mut control = Client::new(jobs, answers);
 
-        assert!(control.patch_player(&player("sefa"), muted()).is_ok());
+        control.patch_player(player("sefa"), muted());
         control.flush();
 
         let message = control.take_error().expect("the lost batch leaves an error");
@@ -1360,13 +1314,13 @@ mod tests {
         );
 
         assert!(matches!(
-            block_on(init(endpoint.as_str())),
+            block_on(answered(init(endpoint.as_str()))),
             ControlResponse::Version { .. }
         ));
 
         let sefa = player("sefa");
-        let registered = register_code("ABC123", &sefa, "sefa");
-        remove_player(&sefa);
+        let registered = answered(register_code("ABC123", sefa, "sefa"));
+        remove_player(sefa);
 
         assert!(matches!(block_on(registered), ControlResponse::Ok));
 
@@ -1386,7 +1340,7 @@ mod tests {
     fn a_stop_right_after_init_still_answers_it() {
         let endpoint = endpoint();
 
-        let answer = init(endpoint.as_str());
+        let answer = answered(init(endpoint.as_str()));
         stop();
 
         let answer = block_on(answer);
@@ -1395,24 +1349,23 @@ mod tests {
             "got {answer:?}"
         );
         assert!(matches!(
-            block_on(super::check_auth(&player("sefa"))),
+            block_on(answered(super::check_auth(player("sefa")))),
             ControlResponse::Error { message } if message.contains("not running")
         ));
     }
 
     #[test]
     fn removing_a_player_frees_their_id() {
-        let (first, second) = player::COLLIDING;
-        let token = player(first);
-        assert!(
-            player::issue(second).is_none(),
-            "the id is taken while its holder is in the game"
-        );
+        let (first, second) = player::collide("sefa", "other");
+        let first = first.expect("the first ckey");
 
-        remove_player(&token);
+        assert_eq!(second, None, "the id is taken while its holder is in the game");
 
-        assert!(
-            player::issue(second).is_some(),
+        remove_player(first);
+
+        assert_eq!(
+            player::claim("other", first),
+            Some(first),
             "the id is free once its holder is removed"
         );
     }
@@ -1421,9 +1374,9 @@ mod tests {
     fn nothing_is_asked_of_a_client_that_is_not_running() {
         assert_eq!(take_error(), None);
         assert!(take_events(32).is_empty());
-        assert!(patch_player(&player("sefa"), muted()).is_err());
+        assert!(patch_player(player("sefa"), muted()).is_err());
         assert!(matches!(
-            block_on(super::check_auth(&player("sefa"))),
+            block_on(answered(super::check_auth(player("sefa")))),
             ControlResponse::Error { .. }
         ));
     }

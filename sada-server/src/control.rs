@@ -249,7 +249,7 @@ mod tests {
     use super::{ControlEvent, MAX_EVENTS_PER_FRAME, collect};
 
     /// An event distinguishable from the others by the player it names.
-    fn event(player: u32) -> ControlEvent {
+    fn event(player: u64) -> ControlEvent {
         ControlEvent::Disconnected {
             player: PlayerId::from_raw(player),
             session: SessionId::new(1, 1),
@@ -275,7 +275,7 @@ mod tests {
     async fn a_frame_holds_no_more_than_the_cap() {
         let (events, mut subscriber) = broadcast::channel(MAX_EVENTS_PER_FRAME * 2);
 
-        for player in 0..MAX_EVENTS_PER_FRAME as u32 + 10 {
+        for player in 0..MAX_EVENTS_PER_FRAME as u64 + 10 {
             events.send(event(player + 1)).expect("a subscriber is listening");
         }
 

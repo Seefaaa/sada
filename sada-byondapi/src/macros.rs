@@ -145,7 +145,7 @@ macro_rules! byond_fn {
         $crate::byond_fn!(@export
             [$(#[doc = $doc])*]
             [$crate::byond_fn!(@doc [] [$name] [$($arg : $arg_ty),*] [$($ret)?])]
-            $name($($arg : $arg_ty),*)
+            $name($($arg : $arg_ty),*) $(-> $ret)?
         );
         $crate::paste::paste! {
             $(#[$met])*

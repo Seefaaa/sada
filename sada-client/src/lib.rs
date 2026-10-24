@@ -18,7 +18,7 @@ fn get_version() -> String { env!("CARGO_PKG_VERSION").to_string() }
 /// be reached. The worker is installed before the calling proc goes to sleep. One already running is stopped as by
 /// `stop`, and the new one starts only once the old one has finished.
 #[byond_fn]
-fn init(path: String) -> impl Future<Output = ControlResponse> { control::init(&path) }
+fn init(path: String) -> impl Future<Output = ControlResponse> { control::answered(control::init(&path)) }
 
 /// Stops the control worker.
 ///
@@ -31,19 +31,21 @@ fn stop() { control::stop() }
 #[byond_fn]
 fn take_error() -> Option<String> { control::take_error() }
 
-/// Returns the player id token for `ckey`, or null when another ckey already holds the id it derives.
+/// Returns the `/datum/sada_player_id` for `ckey`, or null when another ckey already holds the id it derives.
 #[byond_fn]
-fn player_id(ckey: String) -> Option<String> { player::issue(&ckey).map(PlayerId::token) }
+fn player_id(ckey: String) -> Option<CByondValue> { player::issue(&ckey).map(PlayerId::into_datum) }
 
 /// Registers an authentication code for `player`, greeting the browser that redeems it as `ckey`.
 #[byond_fn]
-fn register_code(code: String, player: String, ckey: String) -> impl Future<Output = ControlResponse> {
-    control::register_code(&code, &player, &ckey)
+fn register_code(code: String, player: CByondValue, ckey: String) -> impl Future<Output = ControlResponse> {
+    control::answered(PlayerId::try_from(player).and_then(|player| control::register_code(&code, player, &ckey)))
 }
 
 /// Looks up the session bound to `player`.
 #[byond_fn]
-fn check_auth(player: String) -> impl Future<Output = ControlResponse> { control::check_auth(&player) }
+fn check_auth(player: CByondValue) -> impl Future<Output = ControlResponse> {
+    control::answered(PlayerId::try_from(player).and_then(control::check_auth))
+}
 
 /// Starts transmitting. An empty `freq` means local speech.
 #[byond_fn]
@@ -69,11 +71,11 @@ fn stop_transmitting(session: String) {
 /// `patch` is an assoc list of the fields that changed; absent fields mean unchanged. Returns an empty string when
 /// the patch was accepted, or the reason it was not. Nothing reaches the socket until `flush`.
 #[byond_fn]
-fn patch_player(player: String, patch: CByondValue) -> String {
-    match PlayerPatch::try_from(patch) {
-        Ok(patch) => control::patch_player(&player, patch).err().unwrap_or_default(),
-        Err(refused) => refused,
-    }
+fn patch_player(player: CByondValue, patch: CByondValue) -> String {
+    PlayerId::try_from(player)
+        .and_then(|player| control::patch_player(player, PlayerPatch::try_from(patch)?))
+        .err()
+        .unwrap_or_default()
 }
 
 /// Sends everything `patch_player` has piled up as one batch.
@@ -81,8 +83,14 @@ fn patch_player(player: String, patch: CByondValue) -> String {
 fn flush() { control::flush() }
 
 /// Forgets a player entirely, dropping their authentication with it and freeing their id.
+///
+/// Something that is not a player id leaves an error for `take_error`.
 #[byond_fn]
-fn remove_player(player: String) { control::remove_player(&player) }
+fn remove_player(player: CByondValue) {
+    PlayerId::try_from(player)
+        .map(control::remove_player)
+        .unwrap_or_else(|refused| control::report(format!("remove_player: {refused}")));
+}
 
 /// Takes up to `max` of the events the server has pushed, or null when there are none.
 ///

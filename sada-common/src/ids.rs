@@ -81,32 +81,80 @@ impl From<&str> for Ckey {
 
 /// A player, as the game names them to the voice server.
 ///
-/// The game assigns it and the server only ever compares it: nothing here derives one, checks one against a ckey, or
+/// The game assigns it and the server only ever compares it; nothing here derives one, checks one against a ckey, or
 /// reads any meaning into the number. Two players the game gives the same id are one player as far as the server can
 /// tell, so keeping ids apart is the game's side of the contract.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]
-pub struct PlayerId(u32);
+pub struct PlayerId(u64);
 
 impl PlayerId {
     /// Build an id from its raw representation.
     #[must_use]
-    pub const fn from_raw(raw: u32) -> Self { Self(raw) }
+    pub const fn from_raw(raw: u64) -> Self { Self(raw) }
 
     /// Raw representation, for wire formats that cannot carry a newtype.
     #[must_use]
-    pub const fn as_raw(self) -> u32 { self.0 }
+    pub const fn as_raw(self) -> u64 { self.0 }
 
-    /// The token the game carries this id as.
+    /// The three numbers DM carries this id as: bits 40..64, 16..40 and 0..16.
     ///
-    /// An id uses all 32 bits and DM numbers are single-precision floats, exact only to 2^24, so it travels as a
-    /// decimal string the game hands back untouched rather than as a number it would round.
+    /// None is wider than 24 bits, because DM numbers are single-precision floats and exact only to 2^24.
     #[must_use]
-    pub fn token(self) -> String { self.0.to_string() }
+    pub const fn to_chunks(self) -> [u32; 3] {
+        [
+            (self.0 >> 40) as u32,
+            ((self.0 >> 16) & 0x00FF_FFFF) as u32,
+            (self.0 & 0xFFFF) as u32,
+        ]
+    }
 
-    /// Read back a token, or `None` if the game handed over something that is not one.
+    /// Put an id back together from [`PlayerId::to_chunks`].
     #[must_use]
-    pub fn from_token(token: &str) -> Option<Self> { token.parse().map(Self::from_raw).ok() }
+    pub const fn from_chunks([high, middle, low]: [u32; 3]) -> Self {
+        Self((high as u64) << 40 | (middle as u64) << 16 | low as u64)
+    }
+
+    /// The id as 16 hex digits, which is what DM compares ids and keys lists by.
+    #[must_use]
+    pub fn key(self) -> String { format!("{:016x}", self.0) }
+
+    /// Convert the player ID to a BYOND datum (reference-counted, free after use).
+    ///
+    /// The datum is a `/datum/sada_player_id` built from [`PlayerId::to_chunks`] and [`PlayerId::key`].
+    #[cfg(feature = "byondapi")]
+    #[must_use]
+    pub fn into_datum(self) -> sada_byondapi::sys::CByondValue {
+        use sada_byondapi::{byond, sys::CByondValue};
+
+        let [high, middle, low] = self.to_chunks().map(|chunk| CByondValue::from(chunk as f32));
+        let key = CByondValue::from(self.key());
+
+        let value = byond::new(c"/datum/sada_player_id", &[high, middle, low, key]);
+
+        byond::value_decref(&key);
+
+        value
+    }
+}
+
+#[cfg(feature = "byondapi")]
+impl TryFrom<sada_byondapi::sys::CByondValue> for PlayerId {
+    type Error = String;
+
+    /// Read back a `/datum/sada_player_id`, whose `chunk1`, `chunk2` and `chunk3` hold [`PlayerId::to_chunks`].
+    ///
+    /// Refused, naming what DM handed over, when one of them is missing.
+    fn try_from(value: sada_byondapi::sys::CByondValue) -> Result<Self, Self::Error> {
+        use sada_byondapi::byond;
+
+        let chunk = |var| byond::read_var(&value, var).map(|chunk| unsafe { chunk.data.num } as u32);
+
+        match (chunk(c"chunk1"), chunk(c"chunk2"), chunk(c"chunk3")) {
+            (Some(high), Some(middle), Some(low)) => Ok(Self::from_chunks([high, middle, low])),
+            _ => Err(format!("{:?} is not a player id", byond::to_string(&value))),
+        }
+    }
 }
 
 impl fmt::Display for PlayerId {
@@ -150,13 +198,24 @@ mod tests {
     }
 
     #[test]
-    fn a_player_token_round_trips() {
-        // An id uses all 32 bits and DM is exact only to 2^24, so this one cannot survive the trip as a number.
-        let id = PlayerId::from_raw(0xfef1_9f30);
-        assert!(id.as_raw() > 1 << 24, "the trap only bites past 2^24");
+    fn a_player_id_round_trips_through_its_chunks() {
+        for raw in [0, 1, 0x0000_0100_0000_0001, 0x0a24_ad61_c256_2a55, u64::MAX] {
+            let id = PlayerId::from_raw(raw);
+            let [high, middle, low] = id.to_chunks();
 
-        assert_eq!(PlayerId::from_token(&id.token()), Some(id));
-        assert_eq!(PlayerId::from_token("sefa"), None);
+            assert!(
+                high < 1 << 24 && middle < 1 << 24 && low < 1 << 16,
+                "{raw:#x} needs a float to round"
+            );
+            assert_eq!(PlayerId::from_chunks(id.to_chunks()), id, "{raw:#x}");
+        }
+    }
+
+    #[test]
+    fn a_player_key_is_always_sixteen_digits() {
+        assert_eq!(PlayerId::from_raw(1).key(), "0000000000000001");
+        assert_eq!(PlayerId::from_raw(0x0a24_ad61_c256_2a55).key(), "0a24ad61c2562a55");
+        assert_eq!(PlayerId::from_raw(u64::MAX).key(), "ffffffffffffffff");
     }
 
     #[test]

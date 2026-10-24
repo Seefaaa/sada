@@ -16,7 +16,7 @@
 	/// Last values sent, so only what actually changed is sent again.
 	var/list/sada_cache
 	/// Player id the last update was sent under, kept for Logout.
-	var/sada_id
+	var/datum/sada_player_id/sada_id
 	/// Whether this player is holding the talk key down right now.
 	var/sada_talking = FALSE
 	/// Session the open microphone belongs to.
@@ -28,8 +28,8 @@
 	/// A string rather than a number because DM integers are 24 bit but session ids are 64 bit.
 	var/sada_session = null
 	/// Id the voice server knows this player by, "" if none could be issued, or null
-	/// until sada_get_player() has asked.
-	var/sada_id = null
+	/// until sada_get_player_id() has asked.
+	var/datum/sada_player_id/sada_id = null
 
 /// This player's id with the voice server, or "" when the bridge refused to issue one
 /// because another ckey already holds the id this one derives. Such a player is never
@@ -37,8 +37,9 @@
 /client/proc/sada_get_player_id()
 	if(isnull(sada_id))
 		sada_id = sada_player_id(ckey) || ""
-		SSsada.id_to_client[sada_id] = src
-		if(!sada_id)
+		if(sada_id)
+			SSsada.id_to_client[sada_id.key] = src
+		else
 			stack_trace("sada could not issue a player id for [ckey], voice chat stays off for them")
 	return sada_id
 
@@ -164,10 +165,14 @@
 	if(isliving(living))
 		living.sada_stop_talking()
 
-	if(SSsada.can_fire && sada_id)
-		sada_remove_player(sada_id)
+	if(sada_id)
+		if(SSsada.can_fire)
+			sada_remove_player(sada_id)
 
-	SSsada.id_to_client -= sada_id
+		SSsada.id_to_client -= sada_id.key
+
+	if(isliving(living))
+		living.sada_id = null
 
 	return ..()
 

@@ -183,14 +183,9 @@ mod dm {
         Ok(String::from(&value))
     }
 
-    /// Read a player id, which DM carries as a decimal string because a number would lose its low bits.
+    /// Read a player id, which DM carries as the `/datum/sada_player_id` it was handed.
     pub fn player(field: &str, value: CByondValue) -> Result<PlayerId, String> {
-        let token = string(field, value)?;
-
-        token
-            .parse()
-            .map(PlayerId::from_raw)
-            .map_err(|_| format!("{field:?} holds {token:?}, which is not a player id"))
+        PlayerId::try_from(value).map_err(|refused| format!("{field:?} holds {refused}"))
     }
 
     /// Read a radio frequency.
@@ -464,7 +459,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
 
         match value {
             ControlEvent::Authenticated { player, session } => {
-                let player = CByondValue::from(player.token());
+                let player = player.into_datum();
                 let session = CByondValue::from(session.token());
 
                 let value = byond::new(c"/datum/sada_event/authenticated", &[player, session]);
@@ -475,7 +470,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
                 value
             },
             ControlEvent::Synchronized { players } => {
-                let args = Vec::from_iter(players.into_iter().map(|p| CByondValue::from(p.token())));
+                let args = Vec::from_iter(players.into_iter().map(PlayerId::into_datum));
 
                 let value = byond::new(c"/datum/sada_event/synchronized", &args);
 
@@ -484,7 +479,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
                 value
             },
             ControlEvent::Disconnected { player, session } => {
-                let player = CByondValue::from(player.token());
+                let player = player.into_datum();
                 let session = CByondValue::from(session.token());
 
                 let value = byond::new(c"/datum/sada_event/disconnected", &[player, session]);
@@ -496,8 +491,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
             },
             ControlEvent::Speaking { speaker, listeners } => {
                 let args = Vec::from_iter(
-                    iter::once(CByondValue::from(speaker.token()))
-                        .chain(listeners.into_iter().map(|p| CByondValue::from(p.token()))),
+                    iter::once(speaker.into_datum()).chain(listeners.into_iter().map(PlayerId::into_datum)),
                 );
 
                 let value = byond::new(c"/datum/sada_event/speaking", &args);
@@ -512,8 +506,8 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
                 channel,
                 language,
             } => {
-                let speaker = CByondValue::from(speaker.token());
-                let listener = CByondValue::from(listener.token());
+                let speaker = speaker.into_datum();
+                let listener = listener.into_datum();
                 let channel = channel.map(|f| CByondValue::from(f.0)).unwrap_or(CByondValue::NULL);
                 let language = language.map(CByondValue::from).unwrap_or(CByondValue::NULL);
 

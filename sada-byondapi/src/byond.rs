@@ -61,6 +61,13 @@ pub fn to_string(value: &CByondValue) -> String {
     buf.try_into().unwrap_or_default()
 }
 
+/// Read a variable from a datum, returning `None` when the datum does not have it.
+pub fn read_var(value: &CByondValue, var: &CStr) -> Option<CByondValue> {
+    let mut result = CByondValue::NULL;
+    let success = unsafe { BYONDAPI.Byond_ReadVar(value, var.as_ptr() as _, &mut result) };
+    success.then_some(result)
+}
+
 /// Running work on BYOND's own thread from somewhere else.
 ///
 /// Byondapi may only be touched from the main thread, so anything on the async runtime that needs it hands a closure

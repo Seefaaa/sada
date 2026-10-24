@@ -4,7 +4,9 @@
 // and deliberately contains no /world/New() override, because dropping one into a
 // codebase would replace the game's own world setup.
 
-#define SADA_TEST_SOCKET "/tmp/sada.sock"
+// Where config.toml puts the control socket. dmsrc/test.sh starts a server of its own
+// elsewhere and names it in SADA_TEST_SOCKET.
+#define SADA_TEST_SOCKET (world.GetConfig("env", "SADA_TEST_SOCKET") || "/tmp/sada.sock")
 
 // Chebyshev distance the server's proximity policy uses by default.
 #define SADA_TEST_RANGE 7
@@ -44,30 +46,47 @@
 	sada_stop()
 	Del()
 
-// Two ckeys that derive the same player id.
-#define SADA_TEST_COLLIDING_FIRST "zxboiwrq"
-#define SADA_TEST_COLLIDING_SECOND "iqbltqzu"
+// The key of the id derive() gives "other"
+#define SADA_TEST_OTHER_KEY "0a24ad61c2562a55"
 
-// The bridge issues ids, and the rest of the bindings only ever see those.
+// The bridge issues ids, and the rest of the bindings only ever see those. Every one
+// is a new datum, so they are told apart by key.
 /proc/sada_test_player_ids()
-	var/alpha = sada_player_id("alpha")
+	var/datum/sada_player_id/alpha = sada_player_id("alpha")
+	var/datum/sada_player_id/again = sada_player_id("alpha")
+	var/datum/sada_player_id/beta = sada_player_id("beta")
 
-	if(!istext(alpha))
-		world.log << "FAIL: alpha was not issued a player id token: [alpha]"
-	else if(sada_player_id("alpha") != alpha)
-		world.log << "FAIL: alpha was issued a different id the second time."
-	else if(sada_player_id("beta") == alpha)
+	if(!istype(alpha, /datum/sada_player_id))
+		world.log << "FAIL: alpha was not issued a player id."
+	else if(again.key != alpha.key)
+		world.log << "FAIL: alpha was issued a different id the second time: [alpha], [again]"
+	else if(beta.key == alpha.key)
 		world.log << "FAIL: alpha and beta were issued the same id."
 	else
-		world.log << "OK: player ids are stable string tokens ([alpha])."
+		world.log << "OK: player ids are stable by key ([alpha])."
 
-	var/first = sada_player_id(SADA_TEST_COLLIDING_FIRST)
-	var/second = sada_player_id(SADA_TEST_COLLIDING_SECOND)
+	var/datum/sada_player_id/other = sada_player_id("other")
+	var/spelled = "[num2text(other?.chunk1, 6, 16)][num2text(other?.chunk2, 6, 16)][num2text(other?.chunk3, 4, 16)]"
 
-	if(isnull(first) || !isnull(second))
-		world.log << "FAIL: a ckey whose id belongs to another was not refused: [first], [second]"
+	if(other?.key != SADA_TEST_OTHER_KEY)
+		world.log << "FAIL: other's id has the key [other], expected [SADA_TEST_OTHER_KEY]."
+	else if(spelled != other.key)
+		world.log << "FAIL: other's chunks spell [spelled], not its key [other]."
 	else
-		world.log << "OK: a ckey whose id belongs to another is refused."
+		world.log << "OK: an id survives its trip through three numbers."
+
+	var/refused = sada_patch_player("alpha", list("mute" = TRUE))
+	if(refused)
+		world.log << "OK: a ckey where an id belongs was refused ([refused])."
+	else
+		world.log << "FAIL: a ckey where an id belongs was accepted."
+
+	sada_remove_player("alpha")
+	var/error = sada_take_error()
+	if(error)
+		world.log << "OK: removing something that is not an id leaves an error ([error])."
+	else
+		world.log << "FAIL: removing something that is not an id left no error."
 
 // Describes one player to the server, failing loudly if the patch is refused.
 /proc/sada_test_patch(ckey, x, y, z)
@@ -156,5 +175,4 @@
 
 #undef SADA_TEST_SOCKET
 #undef SADA_TEST_RANGE
-#undef SADA_TEST_COLLIDING_FIRST
-#undef SADA_TEST_COLLIDING_SECOND
+#undef SADA_TEST_OTHER_KEY
