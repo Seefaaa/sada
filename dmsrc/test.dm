@@ -46,8 +46,8 @@
 	sada_stop()
 	Del()
 
-// The key of the id derive() gives "other"
-#define SADA_TEST_OTHER_KEY "0a24ad61c2562a55"
+// The key of the id derive() gives "dave"
+#define SADA_TEST_DAVE_KEY "0746ea1ecf20ac67"
 
 // The bridge issues ids, and the rest of the bindings only ever see those. Every one
 // is a new datum, so they are told apart by key.
@@ -65,13 +65,13 @@
 	else
 		world.log << "OK: player ids are stable by key ([alpha])."
 
-	var/datum/sada_player_id/other = sada_player_id("other")
-	var/spelled = "[num2text(other?.chunk1, 6, 16)][num2text(other?.chunk2, 6, 16)][num2text(other?.chunk3, 4, 16)]"
+	var/datum/sada_player_id/dave = sada_player_id("dave")
+	var/spelled = "[num2text(dave?.chunk1, 6, 16)][num2text(dave?.chunk2, 6, 16)][num2text(dave?.chunk3, 4, 16)]"
 
-	if(other?.key != SADA_TEST_OTHER_KEY)
-		world.log << "FAIL: other's id has the key [other], expected [SADA_TEST_OTHER_KEY]."
-	else if(spelled != other.key)
-		world.log << "FAIL: other's chunks spell [spelled], not its key [other]."
+	if(dave?.key != SADA_TEST_DAVE_KEY)
+		world.log << "FAIL: dave's id has the key [dave], expected [SADA_TEST_DAVE_KEY]."
+	else if(spelled != dave.key)
+		world.log << "FAIL: dave's chunks spell [spelled], not its key [dave]."
 	else
 		world.log << "OK: an id survives its trip through three numbers."
 
@@ -175,4 +175,4 @@
 
 #undef SADA_TEST_SOCKET
 #undef SADA_TEST_RANGE
-#undef SADA_TEST_OTHER_KEY
+#undef SADA_TEST_DAVE_KEY

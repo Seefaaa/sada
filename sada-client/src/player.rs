@@ -5,9 +5,9 @@
 //! game or the server restarts, so a browser the server still holds bound to an id can never end up standing in for
 //! somebody else.
 //!
-//! Deriving means two ckeys can land on one id, however unlikely that is over 64 bits. [`issue`] remembers who holds
-//! each id it gave out and refuses the second ckey, which leaves that player undescribed rather than sharing an entry
-//! with the first.
+//! The derivation is a cryptographic hash, so nobody can pick a ckey that lands on somebody else's id. Two ckeys can
+//! still meet by chance, however unlikely that is over 64 bits. [`issue`] remembers who holds each id it gave out and
+//! refuses the second ckey, which leaves that player undescribed rather than sharing an entry with the first.
 
 use std::{
     cell::RefCell,
@@ -15,12 +15,6 @@ use std::{
 };
 
 use sada_common::PlayerId;
-
-/// Offset basis of the 64-bit FNV-1a hash.
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-
-/// Prime of the 64-bit FNV-1a hash.
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 thread_local! {
     /// The ckey holding each id handed out so far.
@@ -30,16 +24,16 @@ thread_local! {
     static ISSUED: RefCell<HashMap<PlayerId, String>> = RefCell::new(HashMap::new());
 }
 
-/// Derive the id for `ckey`: FNV-1a over its bytes.
+/// Derive the id for `ckey`: the first eight bytes of its BLAKE3 hash, little-endian.
 fn derive(ckey: &str) -> PlayerId {
-    let mut hash = FNV_OFFSET;
+    let mut bytes = [0; size_of::<u64>()];
 
-    for byte in ckey.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
+    blake3::Hasher::new()
+        .update(ckey.as_bytes())
+        .finalize_xof()
+        .fill(&mut bytes);
 
-    PlayerId::from_raw(hash)
+    PlayerId::from_raw(u64::from_le_bytes(bytes))
 }
 
 /// The id for `ckey`, or `None` when a different ckey already holds the id it derives.
@@ -79,10 +73,10 @@ mod tests {
         // What makes a derived id safe across restarts is that it does not move. These pin the function, so a change
         // to it is a decision rather than an accident.
         for (ckey, expected) in [
-            ("sefa", 0x2d04_fe18_d3f5_6128),
-            ("adminbus", 0x5736_a3b5_0385_64b2),
-            ("other", 0x0a24_ad61_c256_2a55),
-            ("ghost", 0x68fb_bff8_8ee6_fed0),
+            ("sefa", 0xa17a_d862_033f_90ce),
+            ("adminbus", 0x209a_9e2b_7aa0_99d9),
+            ("dave", 0x0746_ea1e_cf20_ac67),
+            ("ghost", 0xd9ee_be45_a1fd_d17b),
         ] {
             assert_eq!(derive(ckey), PlayerId::from_raw(expected), "{ckey}");
         }

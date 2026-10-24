@@ -8,6 +8,7 @@ name = "sada"
 crate-type = ["cdylib"]
 
 [dependencies]
+blake3.workspace = true
 flume.workspace = true
 sada-byondapi = { workspace = true, features = ["byond-await"] }
 sada-common = { workspace = true, features = ["byondapi"] }
