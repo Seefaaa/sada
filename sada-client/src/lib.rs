@@ -31,9 +31,9 @@ fn stop() { control::stop() }
 #[byond_fn]
 fn take_error() -> Option<String> { control::take_error() }
 
-/// Returns the `/datum/sada_player_id` for `ckey`, or null when another ckey already holds the id it derives.
+/// Returns the player id for `ckey` as 16 hex digits, or null when another ckey already holds the id it derives.
 #[byond_fn]
-fn player_id(ckey: String) -> Option<CByondValue> { player::issue(&ckey).map(PlayerId::into_datum) }
+fn player_id(ckey: String) -> Option<PlayerId> { player::issue(&ckey) }
 
 /// Registers an authentication code for `player`, greeting the browser that redeems it as `ckey`.
 #[byond_fn]

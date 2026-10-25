@@ -97,68 +97,46 @@ impl PlayerId {
     #[must_use]
     pub const fn as_raw(self) -> u64 { self.0 }
 
-    /// The three numbers DM carries this id as: bits 40..64, 16..40 and 0..16.
-    ///
-    /// None is wider than 24 bits, because DM numbers are single-precision floats and exact only to 2^24.
+    /// The id as 16 lowercase hex digits, which is how DM carries it.
     #[must_use]
-    pub const fn to_chunks(self) -> [u32; 3] {
-        [
-            (self.0 >> 40) as u32,
-            ((self.0 >> 16) & 0x00FF_FFFF) as u32,
-            (self.0 & 0xFFFF) as u32,
-        ]
+    pub fn key(self) -> String { self.to_string() }
+
+    /// Read back an id from [`PlayerId::key`], refusing anything not spelled exactly that way.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        let spelled = key.len() == 16 && key.bytes().all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'));
+        spelled.then(|| u64::from_str_radix(key, 16).ok()).flatten().map(Self)
     }
+}
 
-    /// Put an id back together from [`PlayerId::to_chunks`].
-    #[must_use]
-    pub const fn from_chunks([high, middle, low]: [u32; 3]) -> Self {
-        Self((high as u64) << 40 | (middle as u64) << 16 | low as u64)
-    }
-
-    /// The id as 16 hex digits, which is what DM compares ids and keys lists by.
-    #[must_use]
-    pub fn key(self) -> String { format!("{:016x}", self.0) }
-
-    /// Convert the player ID to a BYOND datum (reference-counted, free after use).
-    ///
-    /// The datum is a `/datum/sada_player_id` built from [`PlayerId::to_chunks`] and [`PlayerId::key`].
-    #[cfg(feature = "byondapi")]
-    #[must_use]
-    pub fn into_datum(self) -> sada_byondapi::sys::CByondValue {
-        use sada_byondapi::{byond, sys::CByondValue};
-
-        let [high, middle, low] = self.to_chunks().map(|chunk| CByondValue::from(chunk as f32));
-        let key = CByondValue::from(self.key());
-
-        let value = byond::new(c"/datum/sada_player_id", &[high, middle, low, key]);
-
-        byond::value_decref(&key);
-
-        value
-    }
+#[cfg(feature = "byondapi")]
+impl From<PlayerId> for sada_byondapi::sys::CByondValue {
+    /// The id as DM carries it, a string of [`PlayerId::key`] (reference-counted, free after use).
+    fn from(value: PlayerId) -> Self { Self::from(value.key()) }
 }
 
 #[cfg(feature = "byondapi")]
 impl TryFrom<sada_byondapi::sys::CByondValue> for PlayerId {
     type Error = String;
 
-    /// Read back a `/datum/sada_player_id`, whose `chunk1`, `chunk2` and `chunk3` hold [`PlayerId::to_chunks`].
+    /// Read back the string [`PlayerId::key`] spelled.
     ///
-    /// Refused, naming what DM handed over, when one of them is missing.
+    /// Refused, naming what DM handed over, when it is anything else.
     fn try_from(value: sada_byondapi::sys::CByondValue) -> Result<Self, Self::Error> {
         use sada_byondapi::byond;
 
-        let chunk = |var| byond::read_var(&value, var).map(|chunk| unsafe { chunk.data.num } as u32);
+        let text = byond::to_string(&value);
 
-        match (chunk(c"chunk1"), chunk(c"chunk2"), chunk(c"chunk3")) {
-            (Some(high), Some(middle), Some(low)) => Ok(Self::from_chunks([high, middle, low])),
-            _ => Err(format!("{:?} is not a player id", byond::to_string(&value))),
-        }
+        byond::value_isstr(&value)
+            .then(|| Self::from_key(&text))
+            .flatten()
+            .ok_or_else(|| format!("{text:?} is not a player id"))
     }
 }
 
 impl fmt::Display for PlayerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) }
+    /// The id as [`PlayerId::key`] spells it, so logs on either side of the bridge name a player the same way.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{:016x}", self.0) }
 }
 
 /// A single-use code the game mints so a browser can prove which player it is.
@@ -198,16 +176,25 @@ mod tests {
     }
 
     #[test]
-    fn a_player_id_round_trips_through_its_chunks() {
+    fn a_player_id_round_trips_through_its_key() {
         for raw in [0, 1, 0x0000_0100_0000_0001, 0x0a24_ad61_c256_2a55, u64::MAX] {
             let id = PlayerId::from_raw(raw);
-            let [high, middle, low] = id.to_chunks();
+            assert_eq!(PlayerId::from_key(&id.key()), Some(id), "{raw:#x}");
+        }
+    }
 
-            assert!(
-                high < 1 << 24 && middle < 1 << 24 && low < 1 << 16,
-                "{raw:#x} needs a float to round"
-            );
-            assert_eq!(PlayerId::from_chunks(id.to_chunks()), id, "{raw:#x}");
+    #[test]
+    fn only_a_key_spelled_exactly_reads_back() {
+        for key in [
+            "alpha",
+            "",
+            "000000000000001",
+            "00000000000000001",
+            "0A24AD61C2562A55",
+            "+000000000000001",
+            "0a24ad61c2562a5g",
+        ] {
+            assert_eq!(PlayerId::from_key(key), None, "{key:?}");
         }
     }
 

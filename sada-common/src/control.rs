@@ -176,14 +176,14 @@ mod dm {
 
     /// Read a string.
     pub fn string(field: &str, value: CByondValue) -> Result<String, String> {
-        if !unsafe { BYONDAPI.ByondValue_IsStr(&value) } {
+        if !byond::value_isstr(&value) {
             return Err(format!("{field:?} wants a string"));
         }
 
         Ok(String::from(&value))
     }
 
-    /// Read a player id, which DM carries as the `/datum/sada_player_id` it was handed.
+    /// Read a player id, which DM carries as the 16 hex digits it was handed.
     pub fn player(field: &str, value: CByondValue) -> Result<PlayerId, String> {
         PlayerId::try_from(value).map_err(|refused| format!("{field:?} holds {refused}"))
     }
@@ -227,11 +227,11 @@ mod dm {
         value: CByondValue,
         item: impl Fn(&str, CByondValue) -> Result<T, String>,
     ) -> Result<Vec<T>, String> {
-        if !unsafe { BYONDAPI.ByondValue_IsList(&value) } {
+        if !byond::value_islist(&value) {
             return Err(format!("{field:?} wants a list"));
         }
 
-        let elements = byond::read_to_vec(|buf, len| unsafe { BYONDAPI.Byond_ReadList(&value, buf, len) }, 8);
+        let elements = byond::read_list(&value, 8);
 
         let mut items = Vec::with_capacity(elements.len());
         let mut refused = None;
@@ -494,7 +494,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
 
         match value {
             ControlEvent::Authenticated { player, session } => {
-                let player = player.into_datum();
+                let player = CByondValue::from(player);
                 let session = CByondValue::from(session.token());
 
                 let value = byond::new(c"/datum/sada_event/authenticated", &[player, session]);
@@ -505,7 +505,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
                 value
             },
             ControlEvent::Synchronized { players } => {
-                let args = Vec::from_iter(players.into_iter().map(PlayerId::into_datum));
+                let args = Vec::from_iter(players.into_iter().map(CByondValue::from));
 
                 let value = byond::new(c"/datum/sada_event/synchronized", &args);
 
@@ -514,7 +514,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
                 value
             },
             ControlEvent::Disconnected { player, session } => {
-                let player = player.into_datum();
+                let player = CByondValue::from(player);
                 let session = CByondValue::from(session.token());
 
                 let value = byond::new(c"/datum/sada_event/disconnected", &[player, session]);
@@ -525,9 +525,7 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
                 value
             },
             ControlEvent::Speaking { speaker, listeners } => {
-                let args = Vec::from_iter(
-                    iter::once(speaker.into_datum()).chain(listeners.into_iter().map(PlayerId::into_datum)),
-                );
+                let args = Vec::from_iter(iter::once(speaker).chain(listeners).map(CByondValue::from));
 
                 let value = byond::new(c"/datum/sada_event/speaking", &args);
 
@@ -541,8 +539,8 @@ impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
                 channel,
                 language,
             } => {
-                let speaker = speaker.into_datum();
-                let listener = listener.into_datum();
+                let speaker = CByondValue::from(speaker);
+                let listener = CByondValue::from(listener);
                 let channel = channel.map(|f| CByondValue::from(f.0)).unwrap_or(CByondValue::NULL);
                 let language = language.map(CByondValue::from).unwrap_or(CByondValue::NULL);
 

@@ -21,7 +21,8 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 	return SADA_CALL(take_error)
 
 // Returns the player's id, or null when another ckey already holds the id this one derives.
-/proc/sada_player_id(ckey) as /datum/sada_player_id
+// An id is 16 hex digits; compare it with == and key lists by it.
+/proc/sada_player_id(ckey) as text|null
 	return SADA_CALL(player_id, ckey)
 
 // Registers an auth code for the player. Sleeps; throws on failure.
@@ -77,7 +78,7 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 
 /// Adds one player's state delta. Absent keys mean unchanged. Returns FALSE when the
 /// batch is full and the patch was not taken.
-/datum/sada_batch/proc/add_patch(datum/sada_player_id/player_id, list/patch)
+/datum/sada_batch/proc/add_patch(player_id, list/patch)
 	if(length(entries) >= SADA_BATCH_LIMIT)
 		return FALSE
 
@@ -88,7 +89,7 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 ///
 /// This drops their authentication with it, so it belongs to a client going away
 /// rather than to a player changing mobs. It is taken even when the batch is full.
-/datum/sada_batch/proc/remove_player(datum/sada_player_id/player_id) as text|null
+/datum/sada_batch/proc/remove_player(player_id) as text|null
 	entries += list(list(player_id))
 	return send()
 
@@ -157,7 +158,7 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 
 /// ControlEvent::Authenticated
 /datum/sada_event/authenticated
-	var/datum/sada_player_id/player_id
+	var/player_id // player id
 	var/session // string
 
 /datum/sada_event/authenticated/New(player_id, session)
@@ -166,14 +167,14 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 
 /// ControlEvent::Synchronized
 /datum/sada_event/synchronized
-	var/list/datum/sada_player_id/players
+	var/list/players // list of player ids
 
 /datum/sada_event/synchronized/New(...)
 	src.players = args.Copy()
 
 /// ControlEvent::Disconnected
 /datum/sada_event/disconnected
-	var/datum/sada_player_id/player_id
+	var/player_id // player id
 	var/session // string
 
 /datum/sada_event/disconnected/New(player_id, session)
@@ -182,8 +183,8 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 
 /// ControlEvent::Speaking
 /datum/sada_event/speaking
-	var/datum/sada_player_id/speaker
-	var/list/datum/sada_player_id/listeners
+	var/speaker // player id
+	var/list/listeners // list of player ids
 
 /datum/sada_event/speaking/New(speaker, ...)
 	src.speaker = speaker
@@ -191,8 +192,8 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 
 /// ControlEvent::Heard
 /datum/sada_event/heard
-	var/datum/sada_player_id/speaker
-	var/datum/sada_player_id/listener
+	var/speaker // player id
+	var/listener // player id
 	var/channel // number or null
 	var/language // string or null
 
@@ -216,32 +217,3 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 	if(!istype(response, expected)) throw "expected [expected] from the voice chat library, got [response || "nothing"]"
 	return response
 
-
-
-/*
-	Player ids
- */
-
-/// A player as the voice server knows them.
-///
-/// The id is 64 bit and DM numbers are exact only to 2^24, so it arrives as three numbers of bits 40..64, 16..40 and 0..16.
-/datum/sada_player_id
-	var/chunk1
-	var/chunk2
-	var/chunk3
-	/// The id as 16 hex digits
-	var/key
-
-/datum/sada_player_id/New(chunk1, chunk2, chunk3, key)
-	src.chunk1 = chunk1
-	src.chunk2 = chunk2
-	src.chunk3 = chunk3
-	src.key = key
-
-/datum/sada_player_id/proc/operator""()
-	return key
-
-// following does not work:
-// /datum/sada_player_id/proc/operator~=(other)
-// 	return src.chunk1 == other.chunk1 && src.chunk2 == other.chunk2 && src.chunk3 == other.chunk3
-// ass language

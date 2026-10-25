@@ -58,8 +58,8 @@ SUBSYSTEM_DEF(sada)
 	/// Every code minted this round, so one is never handed out twice.
 	var/list/used_codes = list()
 
-	/// The client each player id belongs to, keyed by the id's key.
-	var/alist/id_to_client = list()
+	/// The client each player id belongs to, keyed by the id.
+	var/alist/id_to_client = alist()
 
 	/// What the voice server has not been told yet, sent at the end of every fire.
 	var/datum/sada_batch/batch = new
@@ -159,7 +159,7 @@ SUBSYSTEM_DEF(sada)
 ///
 /// The id is freed here rather than when the removal reaches the library, which may
 /// be later.
-/datum/controller/subsystem/sada/proc/remove_player(datum/sada_player_id/player_id)
+/datum/controller/subsystem/sada/proc/remove_player(player_id)
 	sada_release_player_id(player_id)
 	var/refused = batch.remove_player(player_id)
 	if(refused)
@@ -216,8 +216,8 @@ SUBSYSTEM_DEF(sada)
 			stack_trace("unknown event type [event.type]")
 
 /// The client the voice server knows by this player id, or null.
-/datum/controller/subsystem/sada/proc/client_of(datum/sada_player_id/player_id) as /client
-	return id_to_client[player_id.key]
+/datum/controller/subsystem/sada/proc/client_of(player_id) as /client
+	return id_to_client[player_id]
 
 /// Drops every session the server did not just say it still has.
 ///
@@ -226,19 +226,19 @@ SUBSYSTEM_DEF(sada)
 /// server has forgotten lives on in the game for the rest of the round: the player stays
 /// "connected", nothing tells them to reconnect, and every push-to-talk addresses a
 /// session that is gone.
-/datum/controller/subsystem/sada/proc/on_synchronized(list/datum/sada_player_id/players)
+/datum/controller/subsystem/sada/proc/on_synchronized(list/players)
 	var/alist/live = alist()
 
-	for(var/datum/sada_player_id/id as anything in players)
-		live[id.key] = TRUE
+	for(var/id in players)
+		live[id] = TRUE
 
 	for(var/client/candidate as anything in GLOB.clients)
-		if(isnull(candidate.sada_session) || live[candidate.sada_id.key])
+		if(isnull(candidate.sada_session) || live[candidate.sada_id])
 			continue
 
 		on_disconnected(candidate.sada_id, candidate.sada_session)
 
-/datum/controller/subsystem/sada/proc/on_authenticated(datum/sada_player_id/id, session)
+/datum/controller/subsystem/sada/proc/on_authenticated(id, session)
 	var/client/player = client_of(id)
 
 	if(isnull(player))
@@ -261,7 +261,7 @@ SUBSYSTEM_DEF(sada)
 		// them, and it starts them mute and deaf.
 		living.sada_reset()
 
-/datum/controller/subsystem/sada/proc/on_disconnected(datum/sada_player_id/id, session)
+/datum/controller/subsystem/sada/proc/on_disconnected(id, session)
 	var/client/player = client_of(id)
 
 	// The player may already have reconnected on a newer session

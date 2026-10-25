@@ -71,6 +71,10 @@ pub fn read_list(list: &CByondValue, capacity: usize) -> Vec<CByondValue> {
 #[inline]
 pub fn value_islist(value: &CByondValue) -> bool { unsafe { BYONDAPI.ByondValue_IsList(value) } }
 
+/// Check whether a value is a string.
+#[inline]
+pub fn value_isstr(value: &CByondValue) -> bool { unsafe { BYONDAPI.ByondValue_IsStr(value) } }
+
 /// Render any value the way DM's `"[value]"` would, or an empty string if it cannot be rendered.
 pub fn to_string(value: &CByondValue) -> String {
     let mut buf = read_to_vec(|buf, len| unsafe { BYONDAPI.Byond_ToString(value, buf as _, len) }, 24);

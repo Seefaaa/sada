@@ -48,34 +48,31 @@
 	sada_stop()
 	Del()
 
-// The key of the id derive() gives "dave"
-#define SADA_TEST_DAVE_KEY "0746ea1ecf20ac67"
+// The id derive() gives "dave"
+#define SADA_TEST_DAVE_ID "0746ea1ecf20ac67"
 
-// The bridge issues ids, and the rest of the bindings only ever see those. Every one
-// is a new datum, so they are told apart by key.
+// The bridge issues ids, and the rest of the bindings only ever see those. An id is
+// the 16 hex digits of a 64-bit number, so DM compares them as strings.
 /proc/sada_test_player_ids()
-	var/datum/sada_player_id/alpha = sada_player_id("alpha")
-	var/datum/sada_player_id/again = sada_player_id("alpha")
-	var/datum/sada_player_id/beta = sada_player_id("beta")
+	var/alpha = sada_player_id("alpha")
+	var/again = sada_player_id("alpha")
+	var/beta = sada_player_id("beta")
 
-	if(!istype(alpha, /datum/sada_player_id))
-		world.log << "FAIL: alpha was not issued a player id."
-	else if(again.key != alpha.key)
+	if(!istext(alpha) || length(alpha) != 16)
+		world.log << "FAIL: alpha was not issued a player id: [alpha]"
+	else if(again != alpha)
 		world.log << "FAIL: alpha was issued a different id the second time: [alpha], [again]"
-	else if(beta.key == alpha.key)
+	else if(beta == alpha)
 		world.log << "FAIL: alpha and beta were issued the same id."
 	else
-		world.log << "OK: player ids are stable by key ([alpha])."
+		world.log << "OK: player ids are stable ([alpha])."
 
-	var/datum/sada_player_id/dave = sada_player_id("dave")
-	var/spelled = "[num2text(dave?.chunk1, 6, 16)][num2text(dave?.chunk2, 6, 16)][num2text(dave?.chunk3, 4, 16)]"
+	var/dave = sada_player_id("dave")
 
-	if(dave?.key != SADA_TEST_DAVE_KEY)
-		world.log << "FAIL: dave's id has the key [dave], expected [SADA_TEST_DAVE_KEY]."
-	else if(spelled != dave.key)
-		world.log << "FAIL: dave's chunks spell [spelled], not its key [dave]."
+	if(dave != SADA_TEST_DAVE_ID)
+		world.log << "FAIL: dave's id is [dave], expected [SADA_TEST_DAVE_ID]."
 	else
-		world.log << "OK: an id survives its trip through three numbers."
+		world.log << "OK: an id arrives as its 16 hex digits."
 
 	var/datum/sada_batch/batch = new
 	batch.add_patch("alpha", list("mute" = TRUE))
@@ -90,6 +87,18 @@
 	else
 		world.log << "FAIL: a ckey where an id belongs was accepted."
 
+	batch.add_patch(uppertext(alpha), list("mute" = TRUE))
+
+	refused = batch.send()
+	error = sada_take_error()
+
+	if(refused)
+		world.log << "FAIL: a batch with an unreadable entry was not sent: [refused]"
+	else if(error)
+		world.log << "OK: an id spelled in capitals was left out ([error])."
+	else
+		world.log << "FAIL: an id spelled in capitals was accepted."
+
 	sada_release_player_id("alpha")
 	error = sada_take_error()
 
@@ -102,8 +111,8 @@
 // its patches are already recorded as sent, and nothing would ever send a lost
 // removal again.
 /proc/sada_test_batch_without_client()
-	var/datum/sada_player_id/alpha = sada_player_id("alpha")
-	var/datum/sada_player_id/beta = sada_player_id("beta")
+	var/alpha = sada_player_id("alpha")
+	var/beta = sada_player_id("beta")
 	var/datum/sada_batch/batch = new
 
 	batch.add_patch(alpha, list("mute" = TRUE))
@@ -231,4 +240,4 @@
 
 #undef SADA_TEST_SOCKET
 #undef SADA_TEST_RANGE
-#undef SADA_TEST_DAVE_KEY
+#undef SADA_TEST_DAVE_ID
