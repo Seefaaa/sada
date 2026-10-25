@@ -98,16 +98,13 @@ impl TryFrom<sada_byondapi::sys::CByondValue> for PlayerPatch {
     type Error = String;
 
     fn try_from(value: sada_byondapi::sys::CByondValue) -> Result<Self, Self::Error> {
-        use sada_byondapi::{
-            BYONDAPI,
-            byond::{self, read_to_vec},
-        };
+        use sada_byondapi::byond;
 
-        if !unsafe { BYONDAPI.ByondValue_IsList(&value) } {
+        if !byond::value_islist(&value) {
             return Err("a patch is a list".to_owned());
         }
 
-        let list = read_to_vec(|buf, len| unsafe { BYONDAPI.Byond_ReadListAssoc(&value, buf, len) }, 8);
+        let list = byond::read_list_assoc(&value, 8);
 
         let mut patch = Self::default();
         let mut refused = None;
@@ -153,7 +150,7 @@ impl PlayerPatch {
 /// Reading patch fields out of the values DM hands over.
 #[cfg(feature = "byondapi")]
 mod dm {
-    use sada_byondapi::{BYONDAPI, byond, sys::CByondValue};
+    use sada_byondapi::{byond, sys::CByondValue};
 
     use super::{Freq, PlayerId, Position};
 
@@ -162,7 +159,7 @@ mod dm {
 
     /// Read a number.
     pub fn number(field: &str, value: CByondValue) -> Result<f32, String> {
-        if !unsafe { BYONDAPI.ByondValue_IsNum(&value) } {
+        if !byond::value_isnum(&value) {
             return Err(format!("{field:?} wants a number"));
         }
 

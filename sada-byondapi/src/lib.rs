@@ -17,7 +17,7 @@ pub use paste;
 use crate::sys::Byondapi;
 
 /// Byondapi's function table, resolved the first time something reaches for it.
-pub static BYONDAPI: LazyLock<Byondapi> = LazyLock::new(|| init().expect("failed to initialize byondapi"));
+static BYONDAPI: LazyLock<Byondapi> = LazyLock::new(|| init().expect("failed to initialize byondapi"));
 
 /// Look up byondapi's exports in whatever loaded this library.
 fn init() -> Result<Byondapi, Box<dyn std::error::Error>> {

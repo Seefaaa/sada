@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Typed channels between two processes on one machine, over a unix socket or a named pipe.
 //!
 //! A channel is used the way the channels in the standard library are: one call hands back the two ends of it, one end

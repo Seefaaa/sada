@@ -1,4 +1,5 @@
 #![feature(derive_const, const_default, const_trait_impl)]
+#![forbid(unsafe_code)]
 
 //! Shared types and utilities for the Sada workspace.
 //!

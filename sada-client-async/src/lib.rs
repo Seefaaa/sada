@@ -1,7 +1,7 @@
 #![feature(macro_attr)]
 #![allow(unused, missing_docs, clippy::missing_docs_in_private_items)]
 
-use sada_byondapi::{BYONDAPI, byond, sys::CByondValue};
+use sada_byondapi::{byond, sys::CByondValue};
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn hello_world(argc: u32, argv: *mut CByondValue, waiting_proc: CByondValue) {
@@ -18,7 +18,7 @@ pub extern "C-unwind" fn hello_world(argc: u32, argv: *mut CByondValue, waiting_
             let retval = byond::new(c"/datum/hello", &[arg1]);
             byond::value_decref(&arg1);
 
-            unsafe { BYONDAPI.Byond_Return(&waiting_proc, &retval) };
+            byond::r#return(waiting_proc, &retval);
             byond::value_decref(&retval);
         })
     });

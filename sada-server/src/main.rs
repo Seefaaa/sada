@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Voice server for Space Station 13.
 //!
 //! The process is built from three long-lived actors that only ever talk to each

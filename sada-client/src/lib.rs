@@ -1,6 +1,7 @@
 //! A bridge library between game server and VC server.
 
 #![feature(macro_attr)]
+#![forbid(unsafe_code)]
 
 mod control;
 mod player;

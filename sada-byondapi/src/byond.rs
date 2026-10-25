@@ -63,8 +63,25 @@ where
 ///
 /// Read elements are referenced, so the caller must decref them when done.
 #[inline]
-pub fn read_list(list: &CByondValue, capacity: usize) -> Vec<CByondValue> {
-    read_to_vec(|buf, len| unsafe { BYONDAPI.Byond_ReadList(list, buf, len) }, capacity)
+pub fn read_list(list: &CByondValue, with_capacity: usize) -> Vec<CByondValue> {
+    read_to_vec(
+        |buf, len| unsafe { BYONDAPI.Byond_ReadList(list, buf, len) },
+        with_capacity,
+    )
+}
+
+/// Read a list of key-value pairs into a zipped [`Vec<CByondValue>`] (key1, value1, key2, value2, ...), growing the
+/// vector until it fits.
+///
+/// Does not check that the value is a list, so the caller must do that first.
+///
+/// Read elements are referenced, so the caller must decref them when done.
+#[inline]
+pub fn read_list_assoc(list: &CByondValue, with_capacity: usize) -> Vec<CByondValue> {
+    read_to_vec(
+        |buf, len| unsafe { BYONDAPI.Byond_ReadListAssoc(list, buf as _, len) },
+        with_capacity,
+    )
 }
 
 /// Check whether a value is a list.
@@ -74,6 +91,10 @@ pub fn value_islist(value: &CByondValue) -> bool { unsafe { BYONDAPI.ByondValue_
 /// Check whether a value is a string.
 #[inline]
 pub fn value_isstr(value: &CByondValue) -> bool { unsafe { BYONDAPI.ByondValue_IsStr(value) } }
+
+/// Check whether a value is a number.
+#[inline]
+pub fn value_isnum(value: &CByondValue) -> bool { unsafe { BYONDAPI.ByondValue_IsNum(value) } }
 
 /// Render any value the way DM's `"[value]"` would, or an empty string if it cannot be rendered.
 pub fn to_string(value: &CByondValue) -> String {
@@ -87,6 +108,25 @@ pub fn read_var(value: &CByondValue, var: &CStr) -> Option<CByondValue> {
     let mut result = CByondValue::NULL;
     let success = unsafe { BYONDAPI.Byond_ReadVar(value, var.as_ptr() as _, &mut result) };
     success.then_some(result)
+}
+
+/// Return a value to BYOND, from an async `call_ext`.
+///
+/// This is used to return a value from an asynchronous callback to BYOND.
+///
+/// You need to decref the value after returning it if you want it to be freed:
+///
+/// ```no_run
+/// # use sada_byondapi::{byond, sys::CByondValue};
+/// # let waiting_proc = CByondValue::NULL;
+/// let retval = byond::new(c"/datum/hello", &[]);
+/// byond::r#return(waiting_proc, &retval);
+/// byond::value_decref(&retval);
+/// ```
+#[cfg(feature = "byond-await")]
+#[inline]
+pub fn r#return(waiting_proc: CByondValue, value: &CByondValue) {
+    unsafe { BYONDAPI.Byond_Return(&waiting_proc, value) };
 }
 
 /// Running work on BYOND's own thread from somewhere else.
