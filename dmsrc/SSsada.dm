@@ -61,6 +61,9 @@ SUBSYSTEM_DEF(sada)
 	/// The client each player id belongs to, keyed by the id's key.
 	var/alist/id_to_client = list()
 
+	/// What the voice server has not been told yet, sent at the end of every fire.
+	var/datum/sada_batch/batch = new
+
 /*
 	Startup and shutdown
 */
@@ -73,6 +76,7 @@ SUBSYSTEM_DEF(sada)
 	var/control_socket = CONFIG_GET(string/sada_control_socket)
 
 	if(!control_socket)
+		can_fire = FALSE
 		return SS_INIT_NO_NEED
 
 	client_version = sada_get_version()
@@ -97,6 +101,7 @@ SUBSYSTEM_DEF(sada)
 
 /datum/controller/subsystem/sada/Shutdown()
 	sada_stop()
+	batch = new
 	server_version = null
 
 // things that outlive the subsystem
@@ -106,6 +111,7 @@ SUBSYSTEM_DEF(sada)
 	server_version = SSsada.server_version
 	used_codes = SSsada.used_codes
 	id_to_client = SSsada.id_to_client
+	batch = SSsada.batch
 
 /datum/controller/subsystem/sada/stat_entry(msg)
 	msg = "C:[client_version || "NOT-INITIALIZED"]|S:[server_version || "NOT-CONNECTED"]"
@@ -138,10 +144,32 @@ SUBSYSTEM_DEF(sada)
 			player.create_speaking_indicator()
 
 		if(MC_TICK_CHECK)
-			sada_flush()
+			send_batch()
 			return
 
-	sada_flush()
+	send_batch()
+
+/// Sends the batch. One the library would not take stays whole for the next send.
+/datum/controller/subsystem/sada/proc/send_batch()
+	var/refused = batch.send()
+	if(refused)
+		stack_trace("sada could not send a batch: [refused]")
+
+/// Forgets a player on the voice server and frees their id, sending the batch at once.
+///
+/// The id is freed here rather than when the removal reaches the library, which may
+/// be later.
+/datum/controller/subsystem/sada/proc/remove_player(datum/sada_player_id/player_id)
+	sada_release_player_id(player_id)
+	var/refused = batch.remove_player(player_id)
+	if(refused)
+		stack_trace("sada could not send a batch: [refused]")
+
+/// Forgets what the server has been told about every player, so the next fire
+/// describes them all again from scratch.
+/datum/controller/subsystem/sada/proc/invalidate_everyone()
+	for(var/mob/living/player in GLOB.player_list)
+		player.sada_invalidate()
 
 /// Reports whatever the control client could not deliver, and starts over when it lost
 /// something.
@@ -159,8 +187,7 @@ SUBSYSTEM_DEF(sada)
 		has_failure = TRUE
 
 	if(has_failure)
-		for(var/mob/living/player in GLOB.player_list)
-			player.sada_invalidate()
+		invalidate_everyone()
 
 /// Acts on whatever the server has said of its own accord.
 ///
@@ -278,6 +305,7 @@ SUBSYSTEM_DEF(sada)
 
 	used_codes += code
 
+	// known issue: a removal kept from a refused send can land after this and spend the code.
 	try
 		sada_register_code(code, id, player.ckey)
 	catch(var/error)

@@ -6,7 +6,7 @@ mod control;
 mod player;
 
 use sada_byondapi::{byond, byond_fn, sys::CByondValue};
-use sada_common::{ControlEvent, ControlResponse, PlayerId, PlayerPatch, SessionId};
+use sada_common::{ControlEvent, ControlRequest, ControlResponse, PlayerId, SessionId};
 
 /// Returns the version of this library.
 #[byond_fn]
@@ -66,30 +66,37 @@ fn stop_transmitting(session: String) {
     control::stop_transmitting(session);
 }
 
-/// Adds one player's state delta to the batch that the next `flush` sends.
+/// Sends the batch DM has built as one frame, answering null when it was handed over or why it was not.
 ///
-/// `patch` is an assoc list of the fields that changed; absent fields mean unchanged. Returns an empty string when
-/// the patch was accepted, or the reason it was not. Nothing reaches the socket until `flush`.
+/// `entries` is a list of `list(id, patch)` and `list(id)`, a patch and a removal, sent in that order. An entry that
+/// cannot be read is left out and leaves an error for `take_error`; the rest still go.
 #[byond_fn]
-fn patch_player(player: CByondValue, patch: CByondValue) -> String {
-    PlayerId::try_from(player)
-        .and_then(|player| control::patch_player(player, PlayerPatch::try_from(patch)?))
-        .err()
-        .unwrap_or_default()
+fn send_batch(entries: CByondValue) -> Option<String> {
+    if !byond::value_islist(&entries) {
+        return Some("a batch is a list".to_owned());
+    }
+
+    let entries = byond::read_list(&entries, 64);
+
+    let requests = Vec::from_iter(entries.iter().enumerate().filter_map(|(at, &entry)| {
+        ControlRequest::from_batch_entry(entry)
+            .map_err(|refused| control::report(format!("send_batch: entry {}: {refused}", at + 1)))
+            .ok()
+    }));
+
+    entries.iter().for_each(byond::value_decref);
+
+    control::send_batch(requests).err()
 }
 
-/// Sends everything `patch_player` has piled up as one batch.
-#[byond_fn]
-fn flush() { control::flush() }
-
-/// Forgets a player entirely, dropping their authentication with it and freeing their id.
+/// Frees a player's id for another ckey, once the game is done with that player.
 ///
-/// Something that is not a player id leaves an error for `take_error`.
+/// The removal itself travels in the batch. Something that is not a player id leaves an error for `take_error`.
 #[byond_fn]
-fn remove_player(player: CByondValue) {
+fn release_player_id(player: CByondValue) {
     PlayerId::try_from(player)
-        .map(control::remove_player)
-        .unwrap_or_else(|refused| control::report(format!("remove_player: {refused}")));
+        .map(player::forget)
+        .unwrap_or_else(|refused| control::report(format!("release_player_id: {refused}")));
 }
 
 /// Takes up to `max` of the events the server has pushed, or null when there are none.

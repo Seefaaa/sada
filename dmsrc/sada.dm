@@ -40,20 +40,16 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 /proc/sada_stop_transmitting(session)
 	SADA_CALL(stop_transmitting, session)
 
-// Adds one player's state delta to the batch that the next sada_flush() sends.
-// Absent keys mean unchanged. Returns "" when the patch was accepted, or the reason
-// it was not; nothing reaches the socket until the flush.
-/proc/sada_patch_player(player_id, list/patch) as text
-	return SADA_CALL(patch_player, player_id, patch)
+// Sends a batch as one frame; a list of list(player_id, patch) and list(player_id),
+// a patch and a removal. Returns null when the library took it, or why it did not.
+// An entry it cannot read is left out and leaves an error for sada_take_error().
+// Use a /datum/sada_batch rather than building the list by hand.
+/proc/sada_send_batch(list/entries) as text|null
+	return SADA_CALL(send_batch, entries)
 
-// Sends everything sada_patch_player() has piled up as one frame.
-/proc/sada_flush()
-	SADA_CALL(flush)
-
-// Forgets a player entirely. This drops their authentication with it, so it belongs
-// to a client going away rather than to a player changing mobs.
-/proc/sada_remove_player(player_id)
-	SADA_CALL(remove_player, player_id)
+// Frees the player's id for another ckey. The removal itself goes in the batch.
+/proc/sada_release_player_id(player_id)
+	SADA_CALL(release_player_id, player_id)
 
 // Takes up to max of the events the server has pushed, or null when there are none.
 // Nothing is asked of the server here: events arrive on their own and wait in the
@@ -61,6 +57,53 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 /proc/sada_take_events(max) as /datum/sada_events
 	return SADA_CALL(take_events, max)
 
+
+
+/*
+	Batch
+ */
+
+// How many patches one batch holds before it refuses more. A round has far fewer
+// players than this, so reaching it means nothing has been sending the batch.
+#define SADA_BATCH_LIMIT 4096
+
+/// Patches and removals waiting to go out together, in the order they were made.
+///
+/// A removal travels behind every patch before it: a patch that overtook one would
+/// bring the player back on the server for the rest of the round.
+/datum/sada_batch
+	/// list(player_id, patch) for a patch, list(player_id) for a removal
+	var/list/entries = list()
+
+/// Adds one player's state delta. Absent keys mean unchanged. Returns FALSE when the
+/// batch is full and the patch was not taken.
+/datum/sada_batch/proc/add_patch(datum/sada_player_id/player_id, list/patch)
+	if(length(entries) >= SADA_BATCH_LIMIT)
+		return FALSE
+
+	entries += list(list(player_id, patch))
+	return TRUE
+
+/// Forgets a player entirely and sends the batch at once, returning what send() does.
+///
+/// This drops their authentication with it, so it belongs to a client going away
+/// rather than to a player changing mobs. It is taken even when the batch is full.
+/datum/sada_batch/proc/remove_player(datum/sada_player_id/player_id) as text|null
+	entries += list(list(player_id))
+	return send()
+
+/// Sends everything as one frame. Returns null when the library took it, or why it did
+/// not; then everything stays, in order, for the next send.
+/datum/sada_batch/proc/send() as text|null
+	if(!length(entries))
+		return
+
+	var/refused = sada_send_batch(entries)
+
+	if(!refused)
+		entries = list()
+
+	return refused
 
 
 /*

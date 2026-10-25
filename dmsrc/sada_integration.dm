@@ -78,12 +78,11 @@
 	if(!length(patch))
 		return
 
-	var/rejected = sada_patch_player(sada_id, patch)
-	if(rejected)
+	if(!SSsada.batch.add_patch(sada_id, patch))
 		// sada_make_patch has already recorded these values as sent, so the cache has to go;
 		// otherwise the fields it just wrote would never be offered again.
 		sada_invalidate()
-		stack_trace("sada rejected update: [rejected]")
+		stack_trace("sada batch is full, nothing has been sending it")
 
 /// Builds the delta the voice server needs. Absent keys mean unchanged, so a patch
 /// that comes back empty is not sent at all.
@@ -134,9 +133,8 @@
 	if(!SSsada.can_fire || !sada_id)
 		return
 
-	var/rejected = sada_patch_player(sada_id, list("mute" = TRUE, "deaf" = TRUE))
-	if(rejected)
-		stack_trace("sada could not silence player [sada_id]: [rejected]")
+	if(!SSsada.batch.add_patch(sada_id, list("mute" = TRUE, "deaf" = TRUE)))
+		stack_trace("sada could not silence player [sada_id]: the batch is full")
 
 	sada_cache = list()
 	sada_id = null
@@ -167,7 +165,7 @@
 
 	if(sada_id)
 		if(SSsada.can_fire)
-			sada_remove_player(sada_id)
+			SSsada.remove_player(sada_id)
 
 		SSsada.id_to_client -= sada_id.key
 

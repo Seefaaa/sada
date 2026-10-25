@@ -28,23 +28,11 @@ use std::{
     thread,
 };
 
-use sada_common::{
-    AuthCode,
-    Ckey,
-    ControlEvent,
-    ControlRequest,
-    ControlResponse,
-    Freq,
-    PlayerId,
-    PlayerPatch,
-    SessionId,
-    Transmit,
-};
+use sada_common::{AuthCode, Ckey, ControlEvent, ControlRequest, ControlResponse, Freq, PlayerId, SessionId, Transmit};
 use sada_ipc::Endpoint;
 use tokio::sync::oneshot;
 
 use self::client::Client;
-use crate::player;
 
 thread_local! {
     /// Game-thread half of the control client, installed by [`init`].
@@ -117,8 +105,7 @@ pub fn init(endpoint: &str) -> Result<impl Future<Output = ControlResponse> + Se
 /// Stop the worker.
 ///
 /// The worker finishes the exchange it is in, if any, and then exits, and its runtime goes with it. Everything not yet
-/// sent is dropped: queued requests, whose callers are answered with an error, the pending batch and any unreported
-/// failures.
+/// sent is dropped: queued requests, whose callers are answered with an error, and any unreported failures.
 pub fn stop() { CONTROL.set(None); }
 
 /// Take the oldest error that nobody was waiting for, such as a failed fire-and-forget request.
@@ -172,32 +159,17 @@ fn set_transmit(session: SessionId, transmit: Option<Transmit>) {
     let _ = with_control(|control| control.set_transmit(session, transmit));
 }
 
-/// Add one player's state delta to the batch that the next [`flush`] will send.
+/// Hand `requests` to the worker as one batch, or say why it could not take them.
 ///
-/// Nothing reaches the channel until [`flush`].
-pub fn patch_player(player: PlayerId, patch: PlayerPatch) -> Result<(), String> {
-    // Reporting a dropped patch as accepted would leave the game believing it had described a player it never did,
-    // and there is no error queue to fall back on when there is no client at all.
-    with_control(|control| control.patch_player(player, patch))
+/// Nothing is kept for later, a batch that was not handed over is the caller's to deal with.
+pub fn send_batch(requests: Vec<ControlRequest>) -> Result<(), String> {
+    with_control(|control| control.send_batch(requests))?
 }
 
 /// Leave a failure for [`take_error`], for a fire-and-forget request refused before it was ever queued.
 ///
 /// There is nobody to tell when the client is not running.
 pub fn report(message: String) { let _ = with_control(|control| control.push_orphan_error(message)); }
-
-/// Send everything [`patch_player`] has piled up as one batch.
-pub fn flush() { let _ = with_control(Client::flush); }
-
-/// Forget a player entirely.
-///
-/// This also drops the player's authentication on the server, so it belongs to a client going away rather than to a
-/// player changing mobs.
-pub fn remove_player(player: PlayerId) {
-    // The id goes back to the pool whether or not the removal reaches the server: the game is done with this player.
-    player::forget(player);
-    let _ = with_control(|control| control.remove_player(player));
-}
 
 #[cfg(test)]
 mod tests {
@@ -226,7 +198,7 @@ mod tests {
 
         let sefa = player("sefa");
         let registered = answered(register_code("ABC123", sefa, "sefa"));
-        remove_player(sefa);
+        send_batch(vec![ControlRequest::RemovePlayer { player: sefa }]).expect("room in the queue");
 
         assert!(matches!(block_on(registered), ControlResponse::Ok));
 
@@ -261,26 +233,16 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_player_frees_their_id() {
-        let (first, second) = player::collide("sefa", "other");
-        let first = first.expect("the first ckey");
-
-        assert_eq!(second, None, "the id is taken while its holder is in the game");
-
-        remove_player(first);
-
-        assert_eq!(
-            player::claim("other", first),
-            Some(first),
-            "the id is free once its holder is removed"
-        );
-    }
-
-    #[test]
     fn nothing_is_asked_of_a_client_that_is_not_running() {
         assert_eq!(take_error(), None);
         assert!(take_events(32).is_empty());
-        assert!(patch_player(player("sefa"), muted()).is_err());
+        assert!(
+            send_batch(vec![ControlRequest::PatchPlayer {
+                player: player("sefa"),
+                patch: muted(),
+            }])
+            .is_err()
+        );
         assert!(matches!(
             block_on(answered(check_auth(player("sefa")))),
             ControlResponse::Error { .. }

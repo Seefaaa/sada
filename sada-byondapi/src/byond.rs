@@ -29,12 +29,15 @@ pub fn value_decref(value: &CByondValue) { unsafe { BYONDAPI.ByondValue_DecRef(v
 pub fn value_incref(value: &CByondValue) { unsafe { BYONDAPI.ByondValue_IncRef(value) }; }
 
 /// Get the reference count of a value.
+#[inline]
 pub fn ref_count(value: &CByondValue) -> Option<u32> {
     let mut res = 0;
     unsafe { BYONDAPI.Byond_Refcount(value as _, &mut res) }.then_some(res)
 }
 
 /// Call a byondapi read that fills a caller-provided buffer, growing the buffer until it fits.
+///
+/// Read elements are referenced, so the caller must decref them when done.
 pub fn read_to_vec<T>(func: impl Fn(*mut T, *mut u32) -> bool, initial: usize) -> Vec<T>
 where
     T: Default + Copy,
@@ -53,6 +56,20 @@ where
 
     buf
 }
+
+/// Read a list into a [`Vec<CByondValue>`], growing the vector until it fits.
+///
+/// Does not check that the value is a list, so the caller must do that first.
+///
+/// Read elements are referenced, so the caller must decref them when done.
+#[inline]
+pub fn read_list(list: &CByondValue, capacity: usize) -> Vec<CByondValue> {
+    read_to_vec(|buf, len| unsafe { BYONDAPI.Byond_ReadList(list, buf, len) }, capacity)
+}
+
+/// Check whether a value is a list.
+#[inline]
+pub fn value_islist(value: &CByondValue) -> bool { unsafe { BYONDAPI.ByondValue_IsList(value) } }
 
 /// Render any value the way DM's `"[value]"` would, or an empty string if it cannot be rendered.
 pub fn to_string(value: &CByondValue) -> String {

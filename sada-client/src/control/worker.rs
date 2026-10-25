@@ -403,9 +403,18 @@ mod tests {
         version(&control);
 
         // The batch itself succeeds; only one of its elements is rejected.
-        control.patch_player(player("sefa"), muted());
-        control.patch_player(poison, muted());
-        control.flush();
+        control
+            .send_batch(vec![
+                ControlRequest::PatchPlayer {
+                    player: player("sefa"),
+                    patch: muted(),
+                },
+                ControlRequest::PatchPlayer {
+                    player: poison,
+                    patch: muted(),
+                },
+            ])
+            .expect("room in the queue");
 
         let message = wait_for_error(&mut control);
         assert!(message.contains("cannot be patched"), "got {message}");
@@ -463,11 +472,11 @@ mod tests {
             ..PlayerPatch::default()
         };
 
-        for id in 1..1200 {
-            let player = PlayerId::from_raw(id);
-            control.patch_player(player, bulky.clone());
-        }
-        control.flush();
+        let batch = Vec::from_iter((1..1200).map(|id| ControlRequest::PatchPlayer {
+            player: PlayerId::from_raw(id),
+            patch: bulky.clone(),
+        }));
+        control.send_batch(batch).expect("room in the queue");
 
         let message = wait_for_error(&mut control);
         assert!(message.contains("refused"), "got {message}");

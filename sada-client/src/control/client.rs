@@ -5,7 +5,6 @@
 
 use std::{
     collections::VecDeque,
-    mem,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use sada_common::{ControlEvent, ControlRequest, ControlResponse, PlayerId, PlayerPatch, SessionId, Transmit};
+use sada_common::{ControlEvent, ControlRequest, ControlResponse, SessionId, Transmit};
 use sada_ipc::Endpoint;
 use tokio::{sync::oneshot, time::timeout};
 
@@ -41,12 +40,6 @@ const MAX_QUEUED_ERRORS: usize = 256;
 /// The game takes them every fire; if it stops there is no point growing the queue without bound.
 const MAX_QUEUED_EVENTS: usize = 4096;
 
-/// How many requests may pile up in one batch before it is refused.
-///
-/// A round has far fewer players than this, so hitting it means the game stopped flushing rather than that it had a
-/// lot to say.
-const MAX_PENDING_REQUESTS: usize = 4096;
-
 /// How long a request somebody waits on may wait for the worker to start on it before it is dropped unsent.
 const ANSWER_TIMEOUT: Duration = worker::IO_TIMEOUT.saturating_mul(3);
 
@@ -56,11 +49,6 @@ pub struct Client {
     jobs: flume::Sender<Job>,
     /// Failures and events the worker has for the game.
     replies: flume::Receiver<Reply>,
-    /// Requests waiting to go out together as one batch.
-    ///
-    /// The game describes many players per tick and the protocol is built to carry that in a single frame, so patches
-    /// pile up here until [`Client::flush`] sends them.
-    pending: Vec<ControlRequest>,
     /// Failures from requests nobody is waiting for, oldest first, for [`Client::take_error`] to report.
     orphan_errors: VecDeque<String>,
     /// Events the server pushed, oldest first, for [`Client::take_events`] to hand over.
@@ -75,7 +63,6 @@ impl Client {
         Self {
             jobs,
             replies,
-            pending: Vec::new(),
             orphan_errors: VecDeque::new(),
             events: VecDeque::new(),
             retired: Arc::default(),
@@ -140,60 +127,21 @@ impl Client {
         }
     }
 
-    /// Add `request` to the batch that the next [`Client::flush`] will send.
-    fn enqueue(&mut self, request: ControlRequest) {
-        if self.pending.len() >= MAX_PENDING_REQUESTS {
-            self.push_orphan_error("control batch overflowed, the game is not flushing it".to_owned());
-            return;
-        }
-
-        self.pending.push(request);
-    }
-
-    /// Send everything that has piled up as one batch.
+    /// Hand `requests` to the worker as one batch, or say why it could not take them.
     ///
-    /// A batch the worker cannot take is dropped and reported, except for its player removals, which stay at the front
-    /// of the next one. The game re-describes the players it still has once it hears of the failure, but nothing
-    /// would ever send a removal again.
-    pub fn flush(&mut self) {
-        if self.pending.is_empty() {
-            return;
+    /// The caller hears of a refusal here, so it is not also left for [`Client::take_error`]. An empty batch sends
+    /// nothing.
+    pub fn send_batch(&self, requests: Vec<ControlRequest>) -> Result<(), String> {
+        if requests.is_empty() {
+            return Ok(());
         }
 
-        let batch = ControlRequest::Batch(mem::take(&mut self.pending));
-
-        let Err(refused) = self.jobs.try_send(Job {
-            request: batch,
-            waiter: None,
-        }) else {
-            return;
-        };
-
-        let message = refusal(&refused);
-
-        if let ControlRequest::Batch(requests) = refused.into_inner().request {
-            self.pending = Vec::from_iter(
-                requests
-                    .into_iter()
-                    .filter(|request| matches!(request, ControlRequest::RemovePlayer { .. })),
-            );
-        }
-
-        self.push_orphan_error(message);
-    }
-
-    /// Add one player's state delta to the batch that the next [`Client::flush`] will send.
-    pub fn patch_player(&mut self, player: PlayerId, patch: PlayerPatch) {
-        self.enqueue(ControlRequest::PatchPlayer { player, patch });
-    }
-
-    /// Forget a player entirely, behind whatever is still batched.
-    pub fn remove_player(&mut self, player: PlayerId) {
-        // This has to travel behind whatever is still batched. A patch overtaken by the removal would land on a
-        // vacant entry and recreate the player, who would then stay in the routing table for the rest of the round.
-        // It goes past the cap on the batch, which only stands in for a game that stopped flushing.
-        self.pending.push(ControlRequest::RemovePlayer { player });
-        self.flush();
+        self.jobs
+            .try_send(Job {
+                request: ControlRequest::Batch(requests),
+                waiter: None,
+            })
+            .map_err(|refused| refusal(&refused))
     }
 
     /// Send one transmit change, without waiting for it.
@@ -261,12 +209,14 @@ fn refusal(refused: &flume::TrySendError<Job>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use sada_common::Position;
+    use sada_common::{PlayerId, PlayerPatch, Position};
 
     use super::{super::testing::*, *};
 
     #[test]
-    fn patches_travel_as_one_batch() {
+    fn a_batch_travels_as_one_frame_in_order() {
+        // Order is the whole point for the removal, were it to overtake the patch before it, the patch would land on a
+        // vacant entry and bring the player back for the rest of the round.
         let endpoint = endpoint();
         let (server, seen) = serve(
             &endpoint,
@@ -276,7 +226,7 @@ mod tests {
             },
         );
 
-        let mut control = start(&endpoint);
+        let control = start(&endpoint);
         version(&control);
         seen.recv().expect("the version request");
 
@@ -287,16 +237,23 @@ mod tests {
             ..PlayerPatch::default()
         };
 
-        control.patch_player(sefa, patch);
-        control.patch_player(player("ahmet"), muted());
-        control.flush();
+        control
+            .send_batch(vec![
+                ControlRequest::PatchPlayer { player: sefa, patch },
+                ControlRequest::PatchPlayer {
+                    player: player("ahmet"),
+                    patch: muted(),
+                },
+                ControlRequest::RemovePlayer { player: sefa },
+            ])
+            .expect("room in the queue");
 
         let batch = seen.recv_timeout(PATIENCE).expect("the batch reaches the server");
         let ControlRequest::Batch(requests) = batch else {
-            panic!("patches have to be batched, got {batch:?}");
+            panic!("the requests have to be batched, got {batch:?}");
         };
 
-        assert_eq!(requests.len(), 2, "both patches belong to the same frame");
+        assert_eq!(requests.len(), 3, "everything belongs to the same frame");
         assert!(matches!(
             &requests[0],
             ControlRequest::PatchPlayer { player, patch }
@@ -304,42 +261,22 @@ mod tests {
                     && patch.mute == Some(false)
                     && patch.position.is_some_and(|at| (at.x, at.y, at.z) == (4, 9, 2))
         ));
+        assert!(matches!(&requests[1], ControlRequest::PatchPlayer { .. }));
+        assert!(matches!(&requests[2], ControlRequest::RemovePlayer { player } if *player == sefa));
 
         drop(control);
         server.join().expect("the fake server does not panic");
     }
 
     #[test]
-    fn a_removal_travels_behind_the_batch() {
-        let endpoint = endpoint();
-        let (server, seen) = serve(
-            &endpoint,
-            Plan {
-                answers: 2,
-                ..Plan::default()
-            },
-        );
+    fn an_empty_batch_sends_nothing() {
+        let (jobs, held) = flume::bounded(1);
+        let (_replies, answers) = flume::unbounded();
+        let control = Client::new(jobs, answers);
 
-        let mut control = start(&endpoint);
-        version(&control);
-        seen.recv().expect("the version request");
+        control.send_batch(Vec::new()).expect("nothing to refuse");
 
-        // A patch left in the batch and then a removal. Order is the whole point: were the removal to overtake the
-        // patch, the patch would land on a vacant entry and bring the player back for the rest of the round.
-        let sefa = player("sefa");
-        control.patch_player(sefa, muted());
-        control.remove_player(sefa);
-
-        let batch = seen.recv_timeout(PATIENCE).expect("the removal");
-        let ControlRequest::Batch(requests) = batch else {
-            panic!("the removal has to travel behind the batch, got {batch:?}");
-        };
-
-        assert!(matches!(&requests[0], ControlRequest::PatchPlayer { player, .. } if *player == sefa));
-        assert!(matches!(&requests[1], ControlRequest::RemovePlayer { player } if *player == sefa));
-
-        drop(control);
-        server.join().expect("the fake server does not panic");
+        assert!(held.try_recv().is_err(), "an empty batch is not a job");
     }
 
     #[test]
@@ -370,19 +307,20 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_that_cannot_be_queued_leaves_an_error() {
-        // The batch is gone from `pending` the moment `flush` takes it, and the game has already recorded those
-        // fields as sent, so a batch that never reaches the worker has to surface here or those players keep a stale
-        // description for the rest of the round.
+    fn a_batch_that_cannot_be_queued_is_refused_to_its_caller() {
         let (jobs, held) = flume::bounded(0);
         let (_replies, answers) = flume::unbounded();
         let mut control = Client::new(jobs, answers);
 
-        control.patch_player(player("sefa"), muted());
-        control.flush();
+        let refused = control
+            .send_batch(vec![ControlRequest::PatchPlayer {
+                player: player("sefa"),
+                patch: muted(),
+            }])
+            .expect_err("a full queue refuses the batch");
+        assert!(refused.contains("full"), "got {refused}");
 
-        let message = control.take_error().expect("the lost batch leaves an error");
-        assert!(message.contains("full"), "got {message}");
+        assert_eq!(control.take_error(), None, "the caller has heard already");
 
         drop(held);
     }
@@ -464,67 +402,6 @@ mod tests {
         });
 
         assert!(matches!(answer, ControlResponse::Ok), "got {answer:?}");
-    }
-
-    #[test]
-    fn a_removal_the_worker_cannot_take_goes_out_with_the_next_batch() {
-        // The game re-describes the players it still has when it hears of the failure, but nothing sends a removal
-        // again: dropped, it would leave the player's entry and authentication on the server for the rest of the round.
-        let (jobs, held) = flume::bounded(1);
-        let (_replies, answers) = flume::unbounded();
-        let mut control = Client::new(jobs, answers);
-
-        control.set_transmit(SessionId::new(1, 1), None);
-
-        let sefa = player("sefa");
-        control.patch_player(sefa, muted());
-        control.remove_player(sefa);
-
-        let message = control.take_error().expect("the refused batch leaves an error");
-        assert!(message.contains("full"), "got {message}");
-
-        held.try_recv().expect("the job that filled the queue");
-        control.patch_player(player("ahmet"), muted());
-        control.flush();
-
-        let job = held.try_recv().expect("the next batch");
-        assert!(
-            matches!(
-                &job.request,
-                ControlRequest::Batch(requests) if matches!(
-                    requests[..],
-                    [ControlRequest::RemovePlayer { player }, ControlRequest::PatchPlayer { .. }] if player == sefa
-                )
-            ),
-            "the removal has to lead the next batch, without the patch that was refused with it: got {:?}",
-            job.request
-        );
-    }
-
-    #[test]
-    fn a_removal_is_not_refused_by_a_full_batch() {
-        let (jobs, held) = flume::bounded(1);
-        let (_replies, answers) = flume::unbounded();
-        let mut control = Client::new(jobs, answers);
-
-        for id in 1..=MAX_PENDING_REQUESTS as u64 {
-            control.patch_player(PlayerId::from_raw(id), muted());
-        }
-
-        let sefa = player("sefa");
-        control.remove_player(sefa);
-
-        let job = held.try_recv().expect("the batch");
-        assert!(
-            matches!(
-                &job.request,
-                ControlRequest::Batch(requests) if matches!(
-                    requests.last(),
-                    Some(ControlRequest::RemovePlayer { player }) if *player == sefa
-                )
-            ),
-            "the removal has to close the batch"
-        );
     }
 
     #[test]

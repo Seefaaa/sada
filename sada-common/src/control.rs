@@ -310,6 +310,41 @@ pub enum ControlRequest {
     Batch(Vec<ControlRequest>),
 }
 
+#[cfg(feature = "byondapi")]
+impl ControlRequest {
+    /// Read one entry of the batch DM builds, `list(id, patch)` is a [`ControlRequest::PatchPlayer`] and `list(id)` a
+    /// [`ControlRequest::RemovePlayer`].
+    ///
+    /// Anything else is refused, saying what was wrong with it.
+    pub fn from_batch_entry(entry: sada_byondapi::sys::CByondValue) -> Result<Self, String> {
+        use sada_byondapi::byond;
+
+        if !byond::value_islist(&entry) {
+            return Err("an entry is a list".to_owned());
+        }
+
+        let elements = byond::read_list(&entry, 2);
+
+        let request = match elements[..] {
+            [player, patch] => PlayerId::try_from(player).and_then(|player| {
+                Ok(Self::PatchPlayer {
+                    player,
+                    patch: PlayerPatch::try_from(patch)?,
+                })
+            }),
+            [player] => PlayerId::try_from(player).map(|player| Self::RemovePlayer { player }),
+            _ => Err(format!(
+                "an entry is list(id, patch) or list(id), not a list of #{}",
+                elements.len()
+            )),
+        };
+
+        elements.iter().for_each(byond::value_decref);
+
+        request
+    }
+}
+
 /// A response returned by the voice server's control socket.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

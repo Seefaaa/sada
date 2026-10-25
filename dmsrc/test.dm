@@ -20,6 +20,8 @@
 
 	world.log << "sada client version: [sada_get_version()]"
 
+	sada_test_batch_without_client()
+
 	var/datum/sada_response/version/response
 
 	try
@@ -75,47 +77,101 @@
 	else
 		world.log << "OK: an id survives its trip through three numbers."
 
-	var/refused = sada_patch_player("alpha", list("mute" = TRUE))
+	var/datum/sada_batch/batch = new
+	batch.add_patch("alpha", list("mute" = TRUE))
+
+	var/refused = batch.send()
+	var/error = sada_take_error()
+
 	if(refused)
-		world.log << "OK: a ckey where an id belongs was refused ([refused])."
+		world.log << "FAIL: a batch with an unreadable entry was not sent: [refused]"
+	else if(error)
+		world.log << "OK: a ckey where an id belongs was left out ([error])."
 	else
 		world.log << "FAIL: a ckey where an id belongs was accepted."
 
-	sada_remove_player("alpha")
-	var/error = sada_take_error()
-	if(error)
-		world.log << "OK: removing something that is not an id leaves an error ([error])."
-	else
-		world.log << "FAIL: removing something that is not an id left no error."
+	sada_release_player_id("alpha")
+	error = sada_take_error()
 
-// Describes one player to the server, failing loudly if the patch is refused.
-/proc/sada_test_patch(ckey, x, y, z)
-	var/rejected = sada_patch_player(sada_player_id(ckey), list(
+	if(error)
+		world.log << "OK: releasing something that is not an id leaves an error ([error])."
+	else
+		world.log << "FAIL: releasing something that is not an id left no error."
+
+// Without a client nothing is sent, and the batch has to keep all of it, in order:
+// its patches are already recorded as sent, and nothing would ever send a lost
+// removal again.
+/proc/sada_test_batch_without_client()
+	var/datum/sada_player_id/alpha = sada_player_id("alpha")
+	var/datum/sada_player_id/beta = sada_player_id("beta")
+	var/datum/sada_batch/batch = new
+
+	batch.add_patch(alpha, list("mute" = TRUE))
+	var/refused = batch.remove_player(beta)
+	var/list/entries = batch.entries
+
+	if(!refused)
+		world.log << "FAIL: a batch was sent without a client."
+	else if(length(entries) != 2 || length(entries[1]) != 2 || entries[1][1] != alpha || length(entries[2]) != 1 || entries[2][1] != beta)
+		world.log << "FAIL: a refused batch kept [length(entries)] entries, expected alpha's patch then beta's removal."
+	else
+		world.log << "OK: a refused batch keeps its patch and its removal, in order ([refused])."
+
+	batch = new
+	for(var/i in 1 to SADA_BATCH_LIMIT)
+		batch.add_patch(alpha, list("mute" = TRUE))
+
+	if(batch.add_patch(alpha, list("mute" = TRUE)))
+		world.log << "FAIL: a full batch took another patch."
+	else
+		batch.remove_player(beta)
+		var/list/last = batch.entries[length(batch.entries)]
+		if(length(batch.entries) != SADA_BATCH_LIMIT + 1 || length(last) != 1 || last[1] != beta)
+			world.log << "FAIL: a full batch refused a removal."
+		else
+			world.log << "OK: a full batch refuses patches but still takes a removal."
+
+// Adds one player's description to the batch.
+/proc/sada_test_patch(datum/sada_batch/batch, ckey, x, y, z)
+	batch.add_patch(sada_player_id(ckey), list(
 		"mute" = FALSE,
 		"deaf" = FALSE,
 		"position" = (x << 16) | (y << 8) | z,
 	))
 
-	if(rejected)
-		world.log << "FAIL: patch for [ckey] rejected: [rejected]"
+// Sends the batch, failing loudly if it is refused or anything in it was left out.
+/proc/sada_test_send(datum/sada_batch/batch, what)
+	var/refused = batch.send()
+	var/error = sada_take_error()
+
+	if(refused)
+		world.log << "FAIL: [what]: the batch was refused: [refused]"
+	else if(error)
+		world.log << "FAIL: [what]: [error]"
+	else
+		world.log << "OK: [what]."
 
 // Two players within earshot, then far apart. The server recomputes routing for every
 // patch it applies, so its log should show "routing recomputed" with the player count.
 /proc/sada_test_patches()
-	sada_test_patch("alpha", 10, 10, 2)
-	sada_test_patch("beta", 10 + SADA_TEST_RANGE - 1, 10, 2)
-	sada_flush()
-	world.log << "OK: two players patched within earshot."
+	var/datum/sada_batch/batch = new
 
-	sada_test_patch("beta", 10 + SADA_TEST_RANGE + 1, 10, 2)
-	sada_flush()
-	world.log << "OK: beta moved out of earshot."
+	sada_test_patch(batch, "alpha", 10, 10, 2)
+	sada_test_patch(batch, "beta", 10 + SADA_TEST_RANGE - 1, 10, 2)
+	sada_test_send(batch, "two players patched within earshot")
 
-	// A patch the client cannot make sense of has to be refused here rather than
-	// disappearing into a batch.
-	var/refused = sada_patch_player(sada_player_id("alpha"), list("nonsense" = 1))
+	sada_test_patch(batch, "beta", 10 + SADA_TEST_RANGE + 1, 10, 2)
+	sada_test_send(batch, "beta moved out of earshot")
+
+	// A patch the client cannot make sense of has to be reported rather than disappear
+	// into a batch, and must not take the rest of the batch with it.
+	batch.add_patch(sada_player_id("alpha"), list("nonsense" = 1))
+	var/refused = batch.send()
+	var/error = sada_take_error()
 	if(refused)
-		world.log << "OK: an unknown patch field was refused ([refused])."
+		world.log << "FAIL: a batch with an unknown patch field was not sent: [refused]"
+	else if(error)
+		world.log << "OK: an unknown patch field was left out ([error])."
 	else
 		world.log << "FAIL: an unknown patch field was accepted."
 
