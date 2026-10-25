@@ -63,14 +63,7 @@ pub fn serve(endpoint: &Endpoint, plan: Plan) -> (thread::JoinHandle<()>, mpsc::
     let (seen_tx, seen_rx) = mpsc::channel();
     let endpoint = endpoint.clone();
 
-    let handle = thread::spawn(move || {
-        let runtime = runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime for the fake server");
-
-        runtime.block_on(fake_server(endpoint, plan, ready_tx, seen_tx));
-    });
+    let handle = thread::spawn(move || runtime(false).block_on(fake_server(endpoint, plan, ready_tx, seen_tx)));
 
     ready_rx
         .recv_timeout(PATIENCE)
@@ -130,26 +123,22 @@ fn respond(request: &ControlRequest, poison: Option<PlayerId>) -> ControlRespons
 }
 
 /// Start a client against `endpoint`, as `init` does for the game.
-pub fn start(endpoint: &Endpoint) -> Client { Client::start(endpoint.clone(), None).expect("the worker starts").0 }
+pub fn start(endpoint: &Endpoint) -> Client { Client::start(endpoint.clone(), &mut None).expect("the worker starts") }
+
+/// A runtime of the test's own, with its clock `paused` or not.
+fn runtime(paused: bool) -> runtime::Runtime {
+    runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(paused)
+        .build()
+        .expect("a runtime for the test")
+}
 
 /// Drive `future` to completion on a runtime of the test's own, as the async exports' runtime would.
-pub fn block_on<F: Future>(future: F) -> F::Output {
-    runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime for the test")
-        .block_on(future)
-}
+pub fn block_on<F: Future>(future: F) -> F::Output { runtime(false).block_on(future) }
 
 /// Drive `future` on a runtime whose clock is paused, so it skips ahead to the next timer whenever it would idle.
-pub fn block_on_paused<F: Future>(future: F) -> F::Output {
-    runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .expect("a runtime for the test")
-        .block_on(future)
-}
+pub fn block_on_paused<F: Future>(future: F) -> F::Output { runtime(true).block_on(future) }
 
 /// Send `request` and wait for its answer, the way an awaited export does.
 pub fn ask(control: &Client, request: ControlRequest) -> ControlResponse {

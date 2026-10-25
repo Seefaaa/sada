@@ -7,6 +7,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::Duration,
@@ -37,6 +38,8 @@ pub struct Worker {
     jobs: flume::Receiver<Job>,
     /// Failures nobody is waiting for and pushed events, for the game thread.
     replies: flume::Sender<Reply>,
+    /// The game thread's end of `replies`, read only to drop the oldest reply when the game has stopped taking them.
+    unread: flume::Receiver<Reply>,
     /// Current connection, or `None` until the next job reconnects.
     connection: Option<Connection>,
     /// Set once the client has gone away, after which nothing more is sent.
@@ -84,12 +87,14 @@ impl Worker {
         endpoint: Endpoint,
         jobs: flume::Receiver<Job>,
         replies: flume::Sender<Reply>,
+        unread: flume::Receiver<Reply>,
         retired: Arc<AtomicBool>,
     ) -> Self {
         Self {
             endpoint,
             jobs,
             replies,
+            unread,
             connection: None,
             retired,
         }
@@ -97,22 +102,30 @@ impl Worker {
 
     /// Serve jobs on a thread and a runtime of the worker's own, until the game thread drops its end.
     ///
-    /// The worker starts once `previous`, the thread of the worker it replaces, has finished.
-    pub fn spawn(self, previous: Option<thread::JoinHandle<()>>) -> Result<thread::JoinHandle<()>, String> {
+    /// The worker starts once the thread in `last`, that of the worker it replaces, has finished, and puts its own
+    /// thread there in its place. A worker that could not be started leaves `last` alone, so the next one still waits
+    /// it out.
+    pub fn spawn(self, last: &mut Option<thread::JoinHandle<()>>) -> Result<(), String> {
         let runtime = runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|err| format!("failed to build the control runtime: {err}"))?;
 
-        thread::Builder::new()
+        let (handoff, previous) = mpsc::sync_channel::<Option<thread::JoinHandle<()>>>(1);
+
+        let thread = thread::Builder::new()
             .name("sada-control".to_owned())
             .spawn(move || {
-                if let Some(previous) = previous {
+                if let Ok(Some(previous)) = previous.recv() {
                     let _ = previous.join();
                 }
                 runtime.block_on(self.run())
             })
-            .map_err(|err| format!("failed to spawn the control worker: {err}"))
+            .map_err(|err| format!("failed to spawn the control worker: {err}"))?;
+
+        let _ = handoff.send(last.replace(thread));
+
+        Ok(())
     }
 
     /// Serve jobs until the game thread drops its end.
@@ -192,7 +205,8 @@ impl Worker {
             // job reconnect; retrying this one could apply it twice.
             Err(Failed::Broken(message)) => {
                 self.connection = None;
-                Err(Unanswered::Lost(self.report(message)))
+                self.report(message.clone());
+                Err(Unanswered::Lost(message))
             },
         }
     }
@@ -205,9 +219,7 @@ impl Worker {
             let message = describe(&err);
 
             match err {
-                // A request too large to encode never reached the wire, so the connection is still good and the next
-                // one can use it. Losing it here would cost a reconnect and, through the failure the game is told
-                // about, a re-description of every player.
+                // a request too large to encode does not reach the wire, so the connection is still good
                 SendError::Encode(_) => Failed::Refused(format!("control request refused: {message}")),
                 _ => Failed::Broken(format!("failed to send control request: {message}")),
             }
@@ -242,7 +254,7 @@ impl Worker {
     fn on_unsolicited(&mut self, message: Result<ControlMessage, RecvError>) {
         match message {
             Ok(ControlMessage::Events(events)) => self.forward_events(events),
-            // One response per request is the whole of the correlation, so an unasked-for answer means the two ends
+            // one response per request is the whole of the correlation, so an unasked-for answer means the two ends
             // are out of step and nothing further on this connection can be trusted.
             Ok(ControlMessage::Response(_)) => self.lost("the server answered a request that was never sent"),
             Err(RecvError::Closed) => self.lost("the server closed the control channel"),
@@ -251,7 +263,7 @@ impl Worker {
     }
 
     /// Hand pushed events to the game thread.
-    fn forward_events(&self, events: Vec<ControlEvent>) { let _ = self.replies.send(Reply::Events(events)); }
+    fn forward_events(&self, events: Vec<ControlEvent>) { self.reply(Reply::Events(events)); }
 
     /// Drop the connection and tell the game why.
     fn lost(&mut self, reason: impl Into<String>) {
@@ -259,10 +271,15 @@ impl Worker {
         self.report(reason.into());
     }
 
-    /// Tell the game about a failure nobody is waiting for, handing the message back.
-    fn report(&self, message: String) -> String {
-        let _ = self.replies.send(Reply::Failure(message.clone()));
-        message
+    /// Tell the game about a failure nobody is waiting for.
+    fn report(&self, message: String) { self.reply(Reply::Failure(message)); }
+
+    /// Hand `reply` to the game thread, dropping the oldest it has not taken when it has stopped taking them.
+    fn reply(&self, mut reply: Reply) {
+        while let Err(flume::TrySendError::Full(refused)) = self.replies.try_send(reply) {
+            let _ = self.unread.try_recv();
+            reply = refused;
+        }
     }
 }
 
@@ -302,6 +319,7 @@ mod tests {
 
     use super::{super::testing::*, *};
 
+    /// Ckey whose id the test hands the fake server to refuse, so it can put a failure inside a batch.
     const POISON: &str = "poison";
 
     #[test]
@@ -371,7 +389,7 @@ mod tests {
     #[test]
     fn a_failure_inside_a_batch_reaches_the_game() {
         let endpoint = endpoint();
-        let poison = crate::player::issue(POISON).expect("a free id");
+        let poison = player(POISON);
         let (server, _seen) = serve(
             &endpoint,
             Plan {
@@ -497,9 +515,8 @@ mod tests {
 
     #[test]
     fn a_retired_worker_sends_nothing_more() {
-        // With nothing listening, a request that went out would be answered with the failed connect instead.
         let (jobs, queued) = flume::bounded(1);
-        let (replies, _replies) = flume::unbounded();
+        let (replies, unread) = flume::unbounded();
         let (answer, mut answered) = oneshot::channel();
 
         jobs.send(Job {
@@ -511,18 +528,43 @@ mod tests {
         })
         .expect("room in the queue");
 
+        // Gone with the client, as it is in the game, so a worker that skipped the check below would stop at the next
+        // job rather than wait for one forever.
+        drop(jobs);
+
         // The client sets this as it goes away, which is what the worker has to find before sending.
         let retired = Arc::new(AtomicBool::new(true));
 
-        Worker::new(endpoint(), queued, replies, retired)
-            .spawn(None)
-            .expect("the worker starts")
+        let mut thread = None;
+        Worker::new(endpoint(), queued, replies, unread, retired)
+            .spawn(&mut thread)
+            .expect("the worker starts");
+        thread
+            .expect("the worker's thread")
             .join()
             .expect("the worker does not panic");
 
+        // With nothing listening, a request that went out would be answered with the failed connect instead.
         assert!(
             matches!(answered.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
             "the request has to be dropped unanswered"
         );
+    }
+
+    #[test]
+    fn a_game_that_stops_taking_replies_keeps_only_the_newest() {
+        let (_jobs, queued) = flume::bounded(1);
+        let (replies, unread) = flume::bounded(2);
+        let worker = Worker::new(endpoint(), queued, replies, unread.clone(), Arc::default());
+
+        for message in ["first", "second", "third"] {
+            worker.report(message.to_owned());
+        }
+
+        let kept = Vec::from_iter(unread.try_iter().map(|reply| match reply {
+            Reply::Failure(message) => message,
+            Reply::Events(_) => panic!("only failures were reported"),
+        }));
+        assert_eq!(kept, ["second", "third"]);
     }
 }

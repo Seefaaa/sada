@@ -30,6 +30,9 @@ use super::{
 /// How many jobs may be queued for the worker before the game is told to back off.
 const JOB_QUEUE_DEPTH: usize = 256;
 
+/// How many replies the worker may leave for the game before it drops the oldest.
+const REPLY_QUEUE_DEPTH: usize = 64;
+
 /// How many failures nobody is waiting for are kept before the oldest are dropped.
 const MAX_QUEUED_ERRORS: usize = 256;
 
@@ -79,29 +82,19 @@ impl Client {
         }
     }
 
-    /// Start a worker for `endpoint` on a thread of its own, returning the client and the worker's thread.
+    /// Start a worker for `endpoint` on a thread of its own.
     ///
-    /// The worker starts once `previous`, the thread of the worker it replaces, has finished. Dropping the client
-    /// stops the worker as soon as it is done with the exchange it is in; whatever is still queued is dropped unsent.
-    pub fn start(
-        endpoint: Endpoint,
-        previous: Option<thread::JoinHandle<()>>,
-    ) -> Result<(Self, thread::JoinHandle<()>), String> {
+    /// The worker starts once the thread in `last_worker`, that of the worker it replaces, has finished, and takes its
+    /// place there; a worker that could not be started leaves it alone. Dropping the client stops the worker as soon as
+    /// it is done with the exchange it is in; whatever is still queued is dropped unsent.
+    pub fn start(endpoint: Endpoint, last_worker: &mut Option<thread::JoinHandle<()>>) -> Result<Self, String> {
         let (jobs_tx, jobs_rx) = flume::bounded(JOB_QUEUE_DEPTH);
-        let (replies_tx, replies_rx) = flume::unbounded();
+        let (replies_tx, replies_rx) = flume::bounded(REPLY_QUEUE_DEPTH);
 
-        let client = Self::new(jobs_tx, replies_rx);
-        let thread = Worker::new(endpoint, jobs_rx, replies_tx, client.retired.clone()).spawn(previous)?;
+        let client = Self::new(jobs_tx, replies_rx.clone());
+        Worker::new(endpoint, jobs_rx, replies_tx, replies_rx, client.retired.clone()).spawn(last_worker)?;
 
-        Ok((client, thread))
-    }
-
-    /// Hand `job` to the worker without waiting, or say why it could not be.
-    fn queue(&self, job: Job) -> Result<(), String> {
-        self.jobs.try_send(job).map_err(|refused| match refused {
-            flume::TrySendError::Full(_) => "control queue is full".to_owned(),
-            flume::TrySendError::Disconnected(_) => "control worker has stopped".to_owned(),
-        })
+        Ok(client)
     }
 
     /// Queue `request` now and return a future for its answer, or say why it could not be queued.
@@ -116,13 +109,15 @@ impl Client {
         let (answer, mut answered) = oneshot::channel();
         let claim = Arc::new(AtomicBool::new(false));
 
-        self.queue(Job {
-            request,
-            waiter: Some(Waiter {
-                answer,
-                claim: claim.clone(),
-            }),
-        })?;
+        self.jobs
+            .try_send(Job {
+                request,
+                waiter: Some(Waiter {
+                    answer,
+                    claim: claim.clone(),
+                }),
+            })
+            .map_err(|refused| refusal(&refused))?;
 
         Ok(async move {
             let answer = match timeout(ANSWER_TIMEOUT, &mut answered).await {
@@ -140,8 +135,8 @@ impl Client {
     /// One that cannot be queued at all leaves its failure for [`Client::take_error`]: nobody else will hear of it,
     /// and the game has to hear that what it described never went out.
     fn submit_and_forget(&mut self, request: ControlRequest) {
-        if let Err(refused) = self.queue(Job { request, waiter: None }) {
-            self.push_orphan_error(refused);
+        if let Err(refused) = self.jobs.try_send(Job { request, waiter: None }) {
+            self.push_orphan_error(refusal(&refused));
         }
     }
 
@@ -156,6 +151,10 @@ impl Client {
     }
 
     /// Send everything that has piled up as one batch.
+    ///
+    /// A batch the worker cannot take is dropped and reported, except for its player removals, which stay at the front
+    /// of the next one. The game re-describes the players it still has once it hears of the failure, but nothing
+    /// would ever send a removal again.
     pub fn flush(&mut self) {
         if self.pending.is_empty() {
             return;
@@ -163,7 +162,24 @@ impl Client {
 
         let batch = ControlRequest::Batch(mem::take(&mut self.pending));
 
-        self.submit_and_forget(batch);
+        let Err(refused) = self.jobs.try_send(Job {
+            request: batch,
+            waiter: None,
+        }) else {
+            return;
+        };
+
+        let message = refusal(&refused);
+
+        if let ControlRequest::Batch(requests) = refused.into_inner().request {
+            self.pending = Vec::from_iter(
+                requests
+                    .into_iter()
+                    .filter(|request| matches!(request, ControlRequest::RemovePlayer { .. })),
+            );
+        }
+
+        self.push_orphan_error(message);
     }
 
     /// Add one player's state delta to the batch that the next [`Client::flush`] will send.
@@ -175,7 +191,8 @@ impl Client {
     pub fn remove_player(&mut self, player: PlayerId) {
         // This has to travel behind whatever is still batched. A patch overtaken by the removal would land on a
         // vacant entry and recreate the player, who would then stay in the routing table for the rest of the round.
-        self.enqueue(ControlRequest::RemovePlayer { player });
+        // It goes past the cap on the batch, which only stands in for a game that stopped flushing.
+        self.pending.push(ControlRequest::RemovePlayer { player });
         self.flush();
     }
 
@@ -232,6 +249,14 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) { self.retired.store(true, Ordering::Release); }
+}
+
+/// Why the worker could not take a job.
+fn refusal(refused: &flume::TrySendError<Job>) -> String {
+    match refused {
+        flume::TrySendError::Full(_) => "control queue is full".to_owned(),
+        flume::TrySendError::Disconnected(_) => "control worker has stopped".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -439,5 +464,95 @@ mod tests {
         });
 
         assert!(matches!(answer, ControlResponse::Ok), "got {answer:?}");
+    }
+
+    #[test]
+    fn a_removal_the_worker_cannot_take_goes_out_with_the_next_batch() {
+        // The game re-describes the players it still has when it hears of the failure, but nothing sends a removal
+        // again: dropped, it would leave the player's entry and authentication on the server for the rest of the round.
+        let (jobs, held) = flume::bounded(1);
+        let (_replies, answers) = flume::unbounded();
+        let mut control = Client::new(jobs, answers);
+
+        control.set_transmit(SessionId::new(1, 1), None);
+
+        let sefa = player("sefa");
+        control.patch_player(sefa, muted());
+        control.remove_player(sefa);
+
+        let message = control.take_error().expect("the refused batch leaves an error");
+        assert!(message.contains("full"), "got {message}");
+
+        held.try_recv().expect("the job that filled the queue");
+        control.patch_player(player("ahmet"), muted());
+        control.flush();
+
+        let job = held.try_recv().expect("the next batch");
+        assert!(
+            matches!(
+                &job.request,
+                ControlRequest::Batch(requests) if matches!(
+                    requests[..],
+                    [ControlRequest::RemovePlayer { player }, ControlRequest::PatchPlayer { .. }] if player == sefa
+                )
+            ),
+            "the removal has to lead the next batch, without the patch that was refused with it: got {:?}",
+            job.request
+        );
+    }
+
+    #[test]
+    fn a_removal_is_not_refused_by_a_full_batch() {
+        let (jobs, held) = flume::bounded(1);
+        let (_replies, answers) = flume::unbounded();
+        let mut control = Client::new(jobs, answers);
+
+        for id in 1..=MAX_PENDING_REQUESTS as u64 {
+            control.patch_player(PlayerId::from_raw(id), muted());
+        }
+
+        let sefa = player("sefa");
+        control.remove_player(sefa);
+
+        let job = held.try_recv().expect("the batch");
+        assert!(
+            matches!(
+                &job.request,
+                ControlRequest::Batch(requests) if matches!(
+                    requests.last(),
+                    Some(ControlRequest::RemovePlayer { player }) if *player == sefa
+                )
+            ),
+            "the removal has to close the batch"
+        );
+    }
+
+    #[test]
+    fn a_dropped_client_retires_its_worker() {
+        // Its jobs channel closing is not enough: the worker would still be handed every job queued before, and send
+        // them after the game was told the client had stopped.
+        let endpoint = endpoint();
+        let (jobs, queued) = flume::bounded(1);
+        let (replies, answers) = flume::unbounded();
+        let control = Client::new(jobs, answers.clone());
+
+        let mut thread = None;
+        let worker = Worker::new(endpoint, queued, replies, answers, control.retired.clone());
+
+        let answer = control.submit(ControlRequest::Version).expect("room in the queue");
+        drop(control);
+
+        worker.spawn(&mut thread).expect("the worker starts");
+        thread
+            .expect("the worker's thread")
+            .join()
+            .expect("the worker does not panic");
+
+        // With nothing listening, a request that went out would be answered with the failed connect instead.
+        let answer = block_on(answer);
+        assert!(
+            matches!(&answer, ControlResponse::Error { message } if message.contains("stopped")),
+            "got {answer:?}"
+        );
     }
 }

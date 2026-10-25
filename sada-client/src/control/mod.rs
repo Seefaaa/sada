@@ -109,12 +109,9 @@ pub async fn answered(submitted: Result<impl Future<Output = ControlResponse>, S
 ///
 /// A client this replaces is stopped as by [`stop`], and the new worker starts only once the last one has finished.
 pub fn init(endpoint: &str) -> Result<impl Future<Output = ControlResponse> + Send + 'static + use<>, String> {
-    let request = Client::start(Endpoint::new(endpoint), LAST_WORKER.take()).map(|(client, worker)| {
-        LAST_WORKER.set(Some(worker));
-        CONTROL.set(Some(client));
-        ControlRequest::Version
-    })?;
-    with_control(|control| control.submit(request))?
+    let client = LAST_WORKER.with_borrow_mut(|last| Client::start(Endpoint::new(endpoint), last))?;
+    CONTROL.set(Some(client));
+    with_control(|control| control.submit(ControlRequest::Version))?
 }
 
 /// Stop the worker.
