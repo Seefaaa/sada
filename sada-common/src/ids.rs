@@ -40,16 +40,16 @@ impl SessionId {
     #[must_use]
     pub const fn as_raw(self) -> u64 { self.0 }
 
-    /// The token the game carries this id as.
+    /// The token the game carries this id as, 16 lowercase hex digits; the generation's eight, then the slot's.
     ///
-    /// DM numbers are single-precision floats and this is a 64-bit value, so it travels as a decimal string that DM
-    /// only ever hands back.
+    /// DM numbers are single-precision floats and this is a 64-bit value, so it travels as a string that DM only ever
+    /// hands back.
     #[must_use]
-    pub fn token(self) -> String { self.0.to_string() }
+    pub fn token(self) -> String { format!("{:016x}", self.0) }
 
-    /// Read back a token, or `None` if the game handed over something that is not one.
+    /// Read back a token from [`SessionId::token`], refusing anything not spelled exactly that way.
     #[must_use]
-    pub fn from_token(token: &str) -> Option<Self> { token.parse().map(Self::from_raw).ok() }
+    pub fn from_token(token: &str) -> Option<Self> { read_hex(token).map(Self) }
 }
 
 impl fmt::Display for SessionId {
@@ -103,10 +103,13 @@ impl PlayerId {
 
     /// Read back an id from [`PlayerId::key`], refusing anything not spelled exactly that way.
     #[must_use]
-    pub fn from_key(key: &str) -> Option<Self> {
-        let spelled = key.len() == 16 && key.bytes().all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'));
-        spelled.then(|| u64::from_str_radix(key, 16).ok()).flatten().map(Self)
-    }
+    pub fn from_key(key: &str) -> Option<Self> { read_hex(key).map(Self) }
+}
+
+/// Read a 64-bit value spelled as exactly 16 lowercase hex digits, the way DM carries both ids.
+fn read_hex(text: &str) -> Option<u64> {
+    let spelled = text.len() == 16 && text.bytes().all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'));
+    spelled.then(|| u64::from_str_radix(text, 16).ok()).flatten()
 }
 
 #[cfg(feature = "byondapi")]
@@ -223,6 +226,26 @@ mod tests {
         assert_eq!(SessionId::from_token(&session.token()), Some(session));
         assert_ne!(session.token(), session.to_string(), "Display is for people to read");
         assert_eq!(SessionId::from_token(&session.to_string()), None);
+    }
+
+    #[test]
+    fn a_session_token_is_generation_then_slot_in_sixteen_digits() {
+        assert_eq!(SessionId::new(7, 3).token(), "0000000300000007");
+        assert_eq!(SessionId::new(u32::MAX, u32::MAX).token(), "ffffffffffffffff");
+    }
+
+    #[test]
+    fn only_a_token_spelled_exactly_reads_back() {
+        for token in [
+            "",
+            "4294967303",
+            "100000007",
+            "0000000100000007 ",
+            "00000001000000007",
+            "000000010000000A",
+        ] {
+            assert_eq!(SessionId::from_token(token), None, "{token:?}");
+        }
     }
 
     #[test]
