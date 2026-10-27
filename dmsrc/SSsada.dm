@@ -193,27 +193,27 @@ SUBSYSTEM_DEF(sada)
 ///
 /// The server sends these as they happen and the client holds them until asked.
 /datum/controller/subsystem/sada/proc/collect_events()
-	var/datum/sada_events/taken = sada_take_events(SADA_EVENTS_PER_FIRE)
+	var/list/taken = sada_take_events(SADA_EVENTS_PER_FIRE)
 
 	if(isnull(taken))
 		return
 
-	for(var/datum/sada_event/event as anything in taken.events)
+	for(var/list/event as anything in taken)
 		handle_event(event)
 
-/datum/controller/subsystem/sada/proc/handle_event(datum/sada_event/event)
-	switch(event.type)
-		if(/datum/sada_event/synchronized)
-			var/datum/sada_event/synchronized/synced = event
-			on_synchronized(synced.players)
-		if(/datum/sada_event/authenticated)
-			var/datum/sada_event/authenticated/auth = event
-			on_authenticated(auth.player_id, auth.session)
-		if(/datum/sada_event/disconnected)
-			var/datum/sada_event/disconnected/disc = event
-			on_disconnected(disc.player_id, disc.session)
+/// Dispatches one event list on its tag; dmsrc/sada.dm has the layout of each.
+/datum/controller/subsystem/sada/proc/handle_event(list/event)
+	switch(event[1])
+		if(SADA_EVENT_SYNCHRONIZED)
+			on_synchronized(event[2])
+		if(SADA_EVENT_AUTHENTICATED)
+			on_authenticated(event[2], event[3])
+		if(SADA_EVENT_DISCONNECTED)
+			on_disconnected(event[2], event[3])
+		if(SADA_EVENT_SPEAKING, SADA_EVENT_HEARD)
+			EMPTY_BLOCK_GUARD // known, not acted on yet
 		else
-			stack_trace("unknown event type [event.type]")
+			stack_trace("unknown event [event[1]]")
 
 /// The client the voice server knows by this player id, or null.
 /datum/controller/subsystem/sada/proc/client_of(player_id) as /client

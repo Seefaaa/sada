@@ -21,6 +21,7 @@
 	world.log << "sada client version: [sada_get_version()]"
 
 	sada_test_batch_without_client()
+	sada_test_event_layout()
 
 	var/datum/sada_response/version/response
 
@@ -229,14 +230,34 @@
 	else
 		world.log << "OK: session token survives as a string; as a number it would arrive as [as_number["session"]]."
 
+// SSsada reads an event's fields by position, so a field moved, or a tag renamed, on one
+// side and not the other would hand it the wrong value, or no event at all, without any
+// error. The library builds one of every event from known values for this, in debug
+// builds only, and they have to come out as the layout sada.dm gives each tag.
+/proc/sada_test_event_layout()
+	var/list/expected = list(
+		list(SADA_EVENT_AUTHENTICATED, "0000000000000001", "11"),
+		list(SADA_EVENT_SYNCHRONIZED, list("0000000000000002", "0000000000000003")),
+		list(SADA_EVENT_DISCONNECTED, "0000000000000004", "12"),
+		list(SADA_EVENT_SPEAKING, "0000000000000005", list("0000000000000006", "0000000000000007")),
+		list(SADA_EVENT_HEARD, "0000000000000008", "0000000000000009", 1459, "common"),
+		list(SADA_EVENT_HEARD, "000000000000000a", "000000000000000b", null, null),
+	)
+
+	var/actual = json_encode(SADA_CALL(sample_events))
+
+	if(actual != json_encode(expected))
+		world.log << "FAIL: events do not match sada.dm's layout:\n  expected [json_encode(expected)]\n  got      [actual]"
+	else
+		world.log << "OK: every event matches sada.dm's layout."
+
 /proc/sada_test_events()
-	var/datum/sada_events/taken = sada_take_events(32)
-	var/list/datum/sada_event/queued = taken?.events
+	var/list/queued = sada_take_events(32)
 
 	world.log << "Events waiting: [length(queued)]"
 
-	for(var/datum/sada_event/event in queued)
-		world.log << "  [event]"
+	for(var/list/event as anything in queued)
+		world.log << "  [json_encode(event)]"
 
 #undef SADA_TEST_SOCKET
 #undef SADA_TEST_RANGE

@@ -2,7 +2,7 @@
 //!
 //! Re-exports the generated types and adds what bindgen cannot.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, ffi::CStr};
 
 pub use crate::bindings::*;
 use crate::{BYONDAPI, byond};
@@ -113,6 +113,14 @@ impl From<String> for CByondValue {
         unsafe { BYONDAPI.ByondValue_SetStr(&mut value, string.as_ptr() as _) };
 
         value
+    }
+}
+
+impl From<&CStr> for CByondValue {
+    fn from(value: &CStr) -> Self {
+        let mut result = CByondValue::NULL;
+        unsafe { BYONDAPI.ByondValue_SetStr(&mut result, value.as_ptr()) };
+        result
     }
 }
 

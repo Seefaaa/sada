@@ -52,10 +52,10 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 /proc/sada_release_player_id(player_id)
 	SADA_CALL(release_player_id, player_id)
 
-// Takes up to max of the events the server has pushed, or null when there are none.
-// Nothing is asked of the server here: events arrive on their own and wait in the
-// client until the game takes them.
-/proc/sada_take_events(max) as /datum/sada_events
+// Takes up to max of the events the server has pushed, as a list of event lists, or
+// null when there are none. Nothing is asked of the server here, events arrive on their
+// own and wait in the client until the game takes them.
+/proc/sada_take_events(max) as /list
 	return SADA_CALL(take_events, max)
 
 
@@ -149,59 +149,20 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 	Event
  */
 
-/// What sada_take_events() hands over
-/datum/sada_events
-	var/list/datum/sada_event/events // list of /datum/sada_event
+// An event is a list whose first element is one of these tags, followed by its fields.
+// Dispatch on event[1]; the layout each tag promises is beside it.
 
-/datum/sada_events/New(...)
-	src.events = args.Copy()
-
-/// ControlEvent::Authenticated
-/datum/sada_event/authenticated
-	var/player_id // player id
-	var/session // string
-
-/datum/sada_event/authenticated/New(player_id, session)
-	src.player_id = player_id
-	src.session = session
-
-/// ControlEvent::Synchronized
-/datum/sada_event/synchronized
-	var/list/players // list of player ids
-
-/datum/sada_event/synchronized/New(...)
-	src.players = args.Copy()
-
-/// ControlEvent::Disconnected
-/datum/sada_event/disconnected
-	var/player_id // player id
-	var/session // string
-
-/datum/sada_event/disconnected/New(player_id, session)
-	src.player_id = player_id
-	src.session = session
-
-/// ControlEvent::Speaking
-/datum/sada_event/speaking
-	var/speaker // player id
-	var/list/listeners // list of player ids
-
-/datum/sada_event/speaking/New(speaker, ...)
-	src.speaker = speaker
-	src.listeners = args.Copy(2)
-
-/// ControlEvent::Heard
-/datum/sada_event/heard
-	var/speaker // player id
-	var/listener // player id
-	var/channel // number or null
-	var/language // string or null
-
-/datum/sada_event/heard/New(speaker, listener, channel, language)
-	src.speaker = speaker
-	src.listener = listener
-	src.channel = channel
-	src.language = language
+/// ControlEvent::Authenticated: list(tag, player_id, session)
+#define SADA_EVENT_AUTHENTICATED "authenticated"
+/// ControlEvent::Synchronized: list(tag, list(player_id, ...))
+#define SADA_EVENT_SYNCHRONIZED "synchronized"
+/// ControlEvent::Disconnected: list(tag, player_id, session)
+#define SADA_EVENT_DISCONNECTED "disconnected"
+/// ControlEvent::Speaking: list(tag, speaker, list(listener, ...))
+#define SADA_EVENT_SPEAKING "speaking"
+/// ControlEvent::Heard: list(tag, speaker, listener, channel, language);
+/// channel is a number or null, language a string or null
+#define SADA_EVENT_HEARD "heard"
 
 
 /*
@@ -216,4 +177,3 @@ var/static/SADA = (world.system_type == MS_WINDOWS ? "./sada.dll" : "./libsada.s
 	if(!isnull(error)) throw error.message
 	if(!istype(response, expected)) throw "expected [expected] from the voice chat library, got [response || "nothing"]"
 	return response
-

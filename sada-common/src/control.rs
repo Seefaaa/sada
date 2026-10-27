@@ -485,71 +485,36 @@ pub enum ControlEvent {
 #[cfg(feature = "byondapi")]
 impl From<ControlEvent> for sada_byondapi::sys::CByondValue {
     fn from(value: ControlEvent) -> Self {
-        use std::iter;
+        use sada_byondapi::byond;
 
-        use sada_byondapi::{byond, sys::CByondValue};
-
-        match value {
+        let fields = match value {
             ControlEvent::Authenticated { player, session } => {
-                let player = CByondValue::from(player);
-                let session = CByondValue::from(session.token());
-
-                let value = byond::new(c"/datum/sada_event/authenticated", &[player, session]);
-
-                byond::value_decref(&player);
-                byond::value_decref(&session);
-
-                value
+                vec![c"authenticated".into(), player.into(), session.token().into()]
             },
             ControlEvent::Synchronized { players } => {
-                let args = Vec::from_iter(players.into_iter().map(CByondValue::from));
-
-                let value = byond::new(c"/datum/sada_event/synchronized", &args);
-
-                args.into_iter().for_each(|a| byond::value_decref(&a));
-
-                value
+                vec![c"synchronized".into(), byond::list_from(players)]
             },
             ControlEvent::Disconnected { player, session } => {
-                let player = CByondValue::from(player);
-                let session = CByondValue::from(session.token());
-
-                let value = byond::new(c"/datum/sada_event/disconnected", &[player, session]);
-
-                byond::value_decref(&player);
-                byond::value_decref(&session);
-
-                value
+                vec![c"disconnected".into(), player.into(), session.token().into()]
             },
             ControlEvent::Speaking { speaker, listeners } => {
-                let args = Vec::from_iter(iter::once(speaker).chain(listeners).map(CByondValue::from));
-
-                let value = byond::new(c"/datum/sada_event/speaking", &args);
-
-                args.into_iter().for_each(|a| byond::value_decref(&a));
-
-                value
+                vec![c"speaking".into(), speaker.into(), byond::list_from(listeners)]
             },
             ControlEvent::Heard {
                 speaker,
                 listener,
                 channel,
                 language,
-            } => {
-                let speaker = CByondValue::from(speaker);
-                let listener = CByondValue::from(listener);
-                let channel = channel.map(|f| CByondValue::from(f.0)).unwrap_or(CByondValue::NULL);
-                let language = language.map(CByondValue::from).unwrap_or(CByondValue::NULL);
+            } => vec![
+                c"heard".into(),
+                speaker.into(),
+                listener.into(),
+                channel.map(|f| f.0).into(),
+                language.into(),
+            ],
+        };
 
-                let value = byond::new(c"/datum/sada_event/heard", &[speaker, listener, channel, language]);
-
-                byond::value_decref(&speaker);
-                byond::value_decref(&listener);
-                byond::value_decref(&language);
-
-                value
-            },
-        }
+        byond::list_from(fields)
     }
 }
 

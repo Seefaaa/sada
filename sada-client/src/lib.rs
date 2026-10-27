@@ -7,7 +7,7 @@ mod control;
 mod player;
 
 use sada_byondapi::{byond, byond_fn, sys::CByondValue};
-use sada_common::{ControlEvent, ControlRequest, ControlResponse, PlayerId, SessionId};
+use sada_common::{ControlRequest, ControlResponse, PlayerId, SessionId};
 
 /// Returns the version of this library.
 #[byond_fn]
@@ -100,23 +100,51 @@ fn release_player_id(player: CByondValue) {
         .unwrap_or_else(|refused| control::report(format!("release_player_id: {refused}")));
 }
 
-/// Takes up to `max` of the events the server has pushed, or null when there are none.
+/// Takes up to `max` of the events the server has pushed, as a list of them, or null when there are none.
 ///
 /// Nothing is asked of the server here: events arrive on their own and wait in the client until the game takes them.
 #[byond_fn]
-fn take_events(max: u16) -> Option<Events> {
+fn take_events(max: u16) -> Option<CByondValue> {
     let events = control::take_events(max);
-    (!events.is_empty()).then_some(Events(events))
+    (!events.is_empty()).then(|| byond::list_from(events))
 }
 
-/// Events on their way to DM, which sees them as a `/datum/sada_events`.
-struct Events(Vec<ControlEvent>);
+/// One of every event, each field telling itself apart from the others, for the harness to check against the layout
+/// `dmsrc/sada.dm` gives each tag.
+///
+/// Debug builds only: the harness loads one, and a release build has no use for it.
+#[cfg(debug_assertions)]
+#[byond_fn]
+fn sample_events() -> CByondValue {
+    use sada_common::ControlEvent;
 
-impl From<Events> for CByondValue {
-    fn from(value: Events) -> Self {
-        let events = value.0.into_iter().map(CByondValue::from).collect::<Vec<_>>();
-        let value = byond::new(c"/datum/sada_events", &events);
-        events.iter().for_each(byond::value_decref);
-        value
-    }
+    byond::list_from(vec![
+        ControlEvent::Authenticated {
+            player: PlayerId::from_raw(1),
+            session: SessionId::from_raw(11),
+        },
+        ControlEvent::Synchronized {
+            players: vec![PlayerId::from_raw(2), PlayerId::from_raw(3)],
+        },
+        ControlEvent::Disconnected {
+            player: PlayerId::from_raw(4),
+            session: SessionId::from_raw(12),
+        },
+        ControlEvent::Speaking {
+            speaker: PlayerId::from_raw(5),
+            listeners: vec![PlayerId::from_raw(6), PlayerId::from_raw(7)],
+        },
+        ControlEvent::Heard {
+            speaker: PlayerId::from_raw(8),
+            listener: PlayerId::from_raw(9),
+            channel: Some(sada_common::Freq(1459)),
+            language: Some("common".to_owned()),
+        },
+        ControlEvent::Heard {
+            speaker: PlayerId::from_raw(10),
+            listener: PlayerId::from_raw(11),
+            channel: None,
+            language: None,
+        },
+    ])
 }

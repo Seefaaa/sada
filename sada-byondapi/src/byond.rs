@@ -6,6 +6,8 @@ use crate::{BYONDAPI, sys::CByondValue};
 
 /// Build an instance of the DM type `type`, passing `args` to its `New`.
 pub fn new(r#type: &CStr, args: &[CByondValue]) -> CByondValue {
+    // The reference this takes on the type path is never released, deliberately;
+    // the type path lives as long as the world does.
     let mut type_ = CByondValue::NULL;
     let str_id = unsafe { BYONDAPI.Byond_AddGetStrId(r#type.as_ptr() as _) };
     unsafe { BYONDAPI.ByondValue_SetStrId(&mut type_, str_id) };
@@ -18,6 +20,32 @@ pub fn new(r#type: &CStr, args: &[CByondValue]) -> CByondValue {
     }
 
     result
+}
+
+/// Build a list holding `items`, as DM's `list(...)` would.
+///
+/// The list takes references of its own, so the caller still owns `items` and must decref them.
+pub fn list(items: &[CByondValue]) -> CByondValue {
+    let mut result = CByondValue::NULL;
+
+    let success = unsafe {
+        BYONDAPI.Byond_CreateList(&mut result) && BYONDAPI.Byond_WriteList(&result, items.as_ptr(), items.len() as _)
+    };
+
+    if !success {
+        value_decref(&result);
+        panic!("failed to create a list of {} items", items.len());
+    }
+
+    result
+}
+
+/// Build a list of `items`, converting each, and release the converted values once the list holds them.
+pub fn list_from<T: Into<CByondValue>>(items: impl IntoIterator<Item = T>) -> CByondValue {
+    let items = Vec::from_iter(items.into_iter().map(Into::into));
+    let list = list(&items);
+    items.iter().for_each(value_decref);
+    list
 }
 
 /// Drop one reference.
